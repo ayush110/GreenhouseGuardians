@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 INTERVAL = 1.0   # seconds
-SAVE_DIR = "captures"
+SAVE_DIR = "/home/pi/Documents/captures"
 
 def main():
     # Create output folder
