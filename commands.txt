@@ -1,0 +1,7 @@
+cd /Users/ayushshah/Projects/GreenhouseGuardians
+python3 capture_service.py --interval 1.0 --outbox /home/pi/Documents/outbox
+
+# Stop: Ctrl+C
+
+# Optional: verify images are being written
+ls -lh /home/pi/Documents/outbox | tail
