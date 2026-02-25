@@ -17,7 +17,7 @@ for image_path in IMAGE_DIR.glob("*.jpg"):
             print("Uploaded successfully. Deleting image.")
             os.remove(image_path)
         else:
-            print("Upload failed:", response.status_code)
+            print(f"Upload failed: {response.status_code} - {response.text}")
 
     except Exception as e:
         print("Error sending image:", e)
