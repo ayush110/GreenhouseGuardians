@@ -1,4 +1,5 @@
 from picamera2 import Picamera2, Preview
+from libcamera import controls
 from datetime import datetime
 from pathlib import Path
 import time
@@ -22,10 +23,15 @@ def main():
     picam2.start_preview(Preview.QTGL)
     picam2.start()
 
+    # Enable continuous autofocus
+    picam2.set_controls({
+        "AfMode": controls.AfModeEnum.Continuous
+    })
+
     # Let camera settle
     time.sleep(2)
 
-    print("Camera preview started.")
+    print("Camera preview started with continuous autofocus.")
     print("Commands:")
     print("  c + Enter  -> capture image")
     print("  q + Enter  -> quit")
