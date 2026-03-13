@@ -21,8 +21,10 @@ std::string timestamp_now() {
 
 int main() {
     try {
-        fs::path save_dir = "./captures";
+        fs::path save_dir = fs::absolute("./captures");
         fs::create_directories(save_dir);
+
+        std::cout << "Saving to: " << save_dir << "\n";
 
         rs2::pipeline pipe;
         rs2::config cfg;
@@ -37,10 +39,9 @@ int main() {
         float depth_scale = depth_sensor.get_depth_scale();
 
         std::cout << "Depth scale: " << depth_scale << " meters/unit\n";
-        std::cout << "Press ENTER in terminal to capture\n";
+        std::cout << "Press s in preview window to save\n";
         std::cout << "Press q in preview window to quit\n";
 
-        // Warm up camera
         for (int i = 0; i < 30; i++) {
             pipe.wait_for_frames();
         }
@@ -70,16 +71,17 @@ int main() {
                 cv::Mat::AUTO_STEP
             );
 
-            // ----- Depth visualization with histogram equalization -----
-            cv::Mat depth_meters;
-            depth.convertTo(depth_meters, CV_32F, depth_scale);
+            cv::Mat color_copy = color.clone();
+            cv::Mat depth_copy = depth.clone();
 
-            cv::Mat valid_mask = depth > 0;
+            cv::Mat depth_meters;
+            depth_copy.convertTo(depth_meters, CV_32F, depth_scale);
+
+            cv::Mat valid_mask = depth_copy > 0;
 
             float focus_min = 0.3f;
             float focus_max = 1.5f;
 
-            // Only for visualization, not for saved raw depth
             cv::Mat vis_depth = depth_meters.clone();
             vis_depth.setTo(focus_min, vis_depth < focus_min);
             vis_depth.setTo(focus_max, vis_depth > focus_max);
@@ -95,20 +97,18 @@ int main() {
             cv::Mat equalized;
             cv::equalizeHist(depth_8u, equalized);
 
-            // Keep invalid pixels black
             cv::Mat invalid_mask;
             cv::bitwise_not(valid_mask, invalid_mask);
             equalized.setTo(0, invalid_mask);
 
             cv::Mat depth_colormap;
             cv::applyColorMap(equalized, depth_colormap, cv::COLORMAP_TURBO);
-            // ----------------------------------------------------------
 
             cv::Mat preview;
-            cv::hconcat(color, depth_colormap, preview);
+            cv::hconcat(color_copy, depth_colormap, preview);
 
-            int cx = depth.cols / 2;
-            int cy = depth.rows / 2;
+            int cx = depth_copy.cols / 2;
+            int cy = depth_copy.rows / 2;
             float center_depth_m = depth_frame.get_distance(cx, cy);
 
             cv::putText(
@@ -123,7 +123,7 @@ int main() {
 
             cv::putText(
                 preview,
-                "Preview emphasis: 0.3m - 1.5m",
+                "Press s to save, q to quit",
                 cv::Point(20, 65),
                 cv::FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -133,30 +133,32 @@ int main() {
 
             cv::imshow("RealSense Preview (Color | Depth)", preview);
 
-            int key = cv::waitKey(1);
+            int key = cv::waitKey(1) & 0xFF;
+
             if (key == 'q') {
                 break;
             }
 
-            if (std::cin.rdbuf()->in_avail() > 0) {
-                std::string line;
-                std::getline(std::cin, line);
-
+            if (key == 's') {
                 std::string ts = timestamp_now();
 
                 fs::path color_path = save_dir / (ts + "_color.png");
                 fs::path depth_path = save_dir / (ts + "_depth.png");
                 fs::path depth_vis_path = save_dir / (ts + "_depth_vis.png");
 
-                cv::imwrite(color_path.string(), color.clone());
-                cv::imwrite(depth_path.string(), depth.clone());              // raw 16-bit depth
-                cv::imwrite(depth_vis_path.string(), depth_colormap.clone()); // visualization only
+                bool ok1 = cv::imwrite(color_path.string(), color_copy);
+                bool ok2 = cv::imwrite(depth_path.string(), depth_copy);
+                bool ok3 = cv::imwrite(depth_vis_path.string(), depth_colormap);
 
-                std::cout << "\nSaved:\n";
+                std::cout << "\nSave status:\n";
+                std::cout << "  Color:     " << (ok1 ? "OK" : "FAILED") << "\n";
+                std::cout << "  Depth:     " << (ok2 ? "OK" : "FAILED") << "\n";
+                std::cout << "  Depth vis: " << (ok3 ? "OK" : "FAILED") << "\n";
+
+                std::cout << "Paths:\n";
                 std::cout << "  " << color_path << "\n";
                 std::cout << "  " << depth_path << "\n";
-                std::cout << "  " << depth_vis_path << "\n";
-                std::cout << "  Center depth: " << center_depth_m << " m\n\n";
+                std::cout << "  " << depth_vis_path << "\n\n";
             }
         }
 
