@@ -35,12 +35,12 @@ int main() {
 
         auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
         float depth_scale = depth_sensor.get_depth_scale();
+
         std::cout << "Depth scale: " << depth_scale << " meters/unit\n";
+        std::cout << "Press ENTER in terminal to capture\n";
+        std::cout << "Press q in preview window to quit\n";
 
-        std::cout << "Press ENTER in terminal to capture.\n";
-        std::cout << "Press q in preview window to quit.\n";
-
-        // warm up
+        // Warm up camera
         for (int i = 0; i < 30; i++) {
             pipe.wait_for_frames();
         }
@@ -70,9 +70,39 @@ int main() {
                 cv::Mat::AUTO_STEP
             );
 
-            cv::Mat depth_8u, depth_colormap;
-            depth.convertTo(depth_8u, CV_8U, 0.03);
-            cv::applyColorMap(depth_8u, depth_colormap, cv::COLORMAP_JET);
+            // ----- Depth visualization with histogram equalization -----
+            cv::Mat depth_meters;
+            depth.convertTo(depth_meters, CV_32F, depth_scale);
+
+            cv::Mat valid_mask = depth > 0;
+
+            float focus_min = 0.3f;
+            float focus_max = 1.5f;
+
+            // Only for visualization, not for saved raw depth
+            cv::Mat vis_depth = depth_meters.clone();
+            vis_depth.setTo(focus_min, vis_depth < focus_min);
+            vis_depth.setTo(focus_max, vis_depth > focus_max);
+
+            cv::Mat depth_8u;
+            vis_depth.convertTo(
+                depth_8u,
+                CV_8U,
+                255.0 / (focus_max - focus_min),
+                -focus_min * 255.0 / (focus_max - focus_min)
+            );
+
+            cv::Mat equalized;
+            cv::equalizeHist(depth_8u, equalized);
+
+            // Keep invalid pixels black
+            cv::Mat invalid_mask;
+            cv::bitwise_not(valid_mask, invalid_mask);
+            equalized.setTo(0, invalid_mask);
+
+            cv::Mat depth_colormap;
+            cv::applyColorMap(equalized, depth_colormap, cv::COLORMAP_TURBO);
+            // ----------------------------------------------------------
 
             cv::Mat preview;
             cv::hconcat(color, depth_colormap, preview);
@@ -87,6 +117,16 @@ int main() {
                 cv::Point(20, 30),
                 cv::FONT_HERSHEY_SIMPLEX,
                 0.8,
+                cv::Scalar(255, 255, 255),
+                2
+            );
+
+            cv::putText(
+                preview,
+                "Preview emphasis: 0.3m - 1.5m",
+                cv::Point(20, 65),
+                cv::FONT_HERSHEY_SIMPLEX,
+                0.7,
                 cv::Scalar(255, 255, 255),
                 2
             );
@@ -109,8 +149,8 @@ int main() {
                 fs::path depth_vis_path = save_dir / (ts + "_depth_vis.png");
 
                 cv::imwrite(color_path.string(), color.clone());
-                cv::imwrite(depth_path.string(), depth.clone()); // 16-bit raw depth
-                cv::imwrite(depth_vis_path.string(), depth_colormap.clone());
+                cv::imwrite(depth_path.string(), depth.clone());              // raw 16-bit depth
+                cv::imwrite(depth_vis_path.string(), depth_colormap.clone()); // visualization only
 
                 std::cout << "\nSaved:\n";
                 std::cout << "  " << color_path << "\n";
@@ -134,11 +174,3 @@ int main() {
 
     return 0;
 }
-
-/*
-g++ capture_realsense.cpp -o capture_realsense \
-    $(pkg-config --cflags --libs realsense2 opencv4) \
-    -std=c++17  
-
-./capture_realsense
-*/
