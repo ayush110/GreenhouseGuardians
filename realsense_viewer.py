@@ -76,3 +76,12 @@ try:
 finally:
     pipeline.stop()
     cv2.destroyAllWindows()
+
+
+"""
+cd ~/librealsense/build
+rm -f CMakeCache.txt
+
+# Run cmake and capture the full output to see why Python bindings are disabled
+cmake .. -DBUILD_PYTHON_BINDINGS:BOOL=ON -DPYTHON_EXECUTABLE=$(which python3) -DCMAKE_BUILD_TYPE=Release 2>&1 | grep -i -A2 -B2 "python\|binding\|pybind\|wrap"
+"""
