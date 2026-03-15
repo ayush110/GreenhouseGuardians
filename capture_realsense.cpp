@@ -21,7 +21,7 @@ std::string timestamp_now() {
 
 int main() {
     try {
-        fs::path base_dir = fs::absolute("./captures");
+        fs::path base_dir = fs::absolute("./realsense_captures");
 
         fs::path rgb_dir = base_dir / "rgb";
         fs::path depth_dir = base_dir / "depth";
