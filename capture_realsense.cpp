@@ -21,10 +21,19 @@ std::string timestamp_now() {
 
 int main() {
     try {
-        fs::path save_dir = fs::absolute("./captures");
-        fs::create_directories(save_dir);
+        fs::path base_dir = fs::absolute("./captures");
 
-        std::cout << "Saving to: " << save_dir << "\n";
+        fs::path rgb_dir = base_dir / "rgb";
+        fs::path depth_dir = base_dir / "depth";
+        fs::path depth_vis_dir = base_dir / "depth_vis";
+
+        fs::create_directories(rgb_dir);
+        fs::create_directories(depth_dir);
+        fs::create_directories(depth_vis_dir);
+
+        std::cout << "Saving RGB to: " << rgb_dir << "\n";
+        std::cout << "Saving depth to: " << depth_dir << "\n";
+        std::cout << "Saving depth visualization to: " << depth_vis_dir << "\n";
 
         rs2::pipeline pipe;
         rs2::config cfg;
@@ -142,23 +151,18 @@ int main() {
             if (key == 's') {
                 std::string ts = timestamp_now();
 
-                fs::path color_path = save_dir / (ts + "_color.png");
-                fs::path depth_path = save_dir / (ts + "_depth.png");
-                fs::path depth_vis_path = save_dir / (ts + "_depth_vis.png");
+                fs::path color_path = rgb_dir / (ts + ".png");
+                fs::path depth_path = depth_dir / (ts + ".png");
+                fs::path depth_vis_path = depth_vis_dir / (ts + ".png");
 
                 bool ok1 = cv::imwrite(color_path.string(), color_copy);
                 bool ok2 = cv::imwrite(depth_path.string(), depth_copy);
                 bool ok3 = cv::imwrite(depth_vis_path.string(), depth_colormap);
 
-                std::cout << "\nSave status:\n";
-                std::cout << "  Color:     " << (ok1 ? "OK" : "FAILED") << "\n";
-                std::cout << "  Depth:     " << (ok2 ? "OK" : "FAILED") << "\n";
-                std::cout << "  Depth vis: " << (ok3 ? "OK" : "FAILED") << "\n";
-
-                std::cout << "Paths:\n";
-                std::cout << "  " << color_path << "\n";
-                std::cout << "  " << depth_path << "\n";
-                std::cout << "  " << depth_vis_path << "\n\n";
+                std::cout << "\nSaved:\n";
+                std::cout << "  RGB:       " << color_path << "\n";
+                std::cout << "  Depth:     " << depth_path << "\n";
+                std::cout << "  Depth vis: " << depth_vis_path << "\n";
             }
         }
 
