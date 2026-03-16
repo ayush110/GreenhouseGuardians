@@ -4,7 +4,7 @@ import os
 import mimetypes
 
 API_URL = "https://deenp03-capstone-backend.hf.space/api/classify"
-IMAGE_DIR = Path("/home/pi/Documents/single_captures")
+IMAGE_DIR = Path("/home/pi/Documents/realsense_captures2/rgb")
 
 for image_path in IMAGE_DIR.glob("*.jpg"):
     print(f"Sending {image_path.name}...")
