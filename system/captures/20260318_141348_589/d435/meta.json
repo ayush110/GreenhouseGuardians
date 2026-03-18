@@ -1,0 +1,19 @@
+{
+  "timestamp": "20260318_141348_704",
+  "frame_counter": 35809,
+  "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
+  "depth_dtype": "uint16",
+  "depth_shape": [
+    480,
+    640
+  ],
+  "depth_scale_m_per_unit": 0.001,
+  "intrinsics": {
+    "fx": 618.390381,
+    "fy": 618.522888,
+    "cx": 323.861389,
+    "cy": 243.554535,
+    "width": 640,
+    "height": 480
+  }
+}

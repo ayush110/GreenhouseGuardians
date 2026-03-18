@@ -106,7 +106,7 @@ HTML = """
         </div>
         <div class="card">
             <h3>Pi Zero RGB</h3>
-            <img id="pizero" src="{{ pi_zero_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+            <img id="pizero" src="{{ pi_zero_base }}/frame.jpg?ts={{ now_ts }}" />
         </div>
     </div>
 
@@ -116,6 +116,8 @@ HTML = """
     </div>
 
     <script>
+        let piZeroTimer = null;
+
         async function captureAll() {
             const status = document.getElementById("status");
             status.textContent = "Capturing all cameras...";
@@ -135,7 +137,6 @@ HTML = """
         async function checkHealth() {
             const status = document.getElementById("status");
             const healthBox = document.getElementById("healthBox");
-            status.textContent = "Checking health...";
             try {
                 const res = await fetch("/health_all");
                 const data = await res.json();
@@ -146,15 +147,25 @@ HTML = """
             }
         }
 
+        function startPiZeroPolling() {
+            const img = document.getElementById("pizero");
+            if (piZeroTimer) clearInterval(piZeroTimer);
+
+            piZeroTimer = setInterval(() => {
+                img.src = "{{ pi_zero_base }}/frame.jpg?ts=" + Date.now();
+            }, 80); // ~12.5 fps fresh-frame polling
+        }
+
         function reloadStreams() {
             const ts = Date.now();
             document.getElementById("d435rgb").src = "{{ d435_base }}/stream/rgb.mjpg?ts=" + ts;
             document.getElementById("d435depth").src = "{{ d435_base }}/stream/depth.mjpg?ts=" + ts;
-            document.getElementById("pizero").src = "{{ pi_zero_base }}/stream/rgb.mjpg?ts=" + ts;
+            document.getElementById("pizero").src = "{{ pi_zero_base }}/frame.jpg?ts=" + ts;
         }
 
         window.addEventListener("load", () => {
             checkHealth();
+            startPiZeroPolling();
             setInterval(checkHealth, 5000);
         });
     </script>
@@ -275,7 +286,7 @@ def capture_all():
 
     # Capture Pi Zero
     try:
-        r = requests.post(f"{PI_ZERO_BASE}/capture", timeout=10)
+        r = requests.post(f"{PI_ZERO_BASE}/capture", timeout=20)
         if r.status_code != 200:
             raise RuntimeError(f"Pi Zero capture failed with status {r.status_code}")
 
