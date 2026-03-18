@@ -1,82 +1,101 @@
 from flask import Flask, Response, jsonify
 from picamera2 import Picamera2
-import cv2
+from picamera2.encoders import MJPEGEncoder
+from picamera2.outputs import FileOutput
+import threading
 import time
 from datetime import datetime
-import threading
+import io
 
 app = Flask(__name__)
 
 CAM_NAME = "pi_zero_cam"
 
-# Preview resolution for dashboard
-PREVIEW_WIDTH = 1280
-PREVIEW_HEIGHT = 720
+# Preview stream resolution
+PREVIEW_WIDTH = 960
+PREVIEW_HEIGHT = 540
 
 # Full-resolution still capture
 STILL_WIDTH = 4608
 STILL_HEIGHT = 2592
 
-JPEG_QUALITY_PREVIEW = 70
 JPEG_QUALITY_CAPTURE = 95
 
-# Lower = more responsive, higher CPU/network
-PREVIEW_INTERVAL_SEC = 0.03   # ~33 fps max target
 
+class StreamingOutput(io.BufferedIOBase):
+    def __init__(self):
+        self.frame = None
+        self.condition = threading.Condition()
+        self.timestamp = ""
+        self.frame_counter = 0
+
+    def write(self, buf):
+        with self.condition:
+            self.frame = buf
+            self.timestamp = timestamp_now()
+            self.frame_counter += 1
+            self.condition.notify_all()
+
+
+app_output = StreamingOutput()
 picam2 = Picamera2()
 camera_lock = threading.Lock()
-
-latest_preview_jpg = None
-latest_preview_ts = ""
-preview_counter = 0
-running = True
 
 
 def timestamp_now():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
-def encode_jpeg(img, quality=80):
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        return None
-    return buf.tobytes()
-
-
 def configure_preview():
-    preview_config = picam2.create_video_configuration(
+    config = picam2.create_video_configuration(
         main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"},
-        buffer_count=2
+        buffer_count=3
     )
-    picam2.configure(preview_config)
+    picam2.configure(config)
+
+
+def start_preview_stream():
+    encoder = MJPEGEncoder()
+    picam2.start_recording(encoder, FileOutput(app_output))
+
+
+def stop_preview_stream():
+    try:
+        picam2.stop_recording()
+    except Exception:
+        try:
+            picam2.stop()
+        except Exception:
+            pass
 
 
 def init_camera():
     configure_preview()
-    picam2.start()
+    start_preview_stream()
     time.sleep(2)
 
 
-def preview_loop():
-    global latest_preview_jpg, latest_preview_ts, preview_counter, running
-
-    while running:
+def mjpeg_generator():
+    while True:
         try:
-            with camera_lock:
-                frame = picam2.capture_array("main")
+            with app_output.condition:
+                app_output.condition.wait()
+                frame = app_output.frame
+            if frame is None:
+                continue
 
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            jpg = encode_jpeg(frame_bgr, JPEG_QUALITY_PREVIEW)
-            if jpg is not None:
-                latest_preview_jpg = jpg
-                latest_preview_ts = timestamp_now()
-                preview_counter += 1
-
-            time.sleep(PREVIEW_INTERVAL_SEC)
-
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n\r\n"
+                + frame +
+                b"\r\n"
+            )
+        except GeneratorExit:
+            break
         except Exception as e:
-            print(f"Preview loop error: {e}")
-            time.sleep(0.1)
+            print(f"Stream generator error: {e}")
+            time.sleep(0.05)
 
 
 @app.route("/health")
@@ -84,29 +103,31 @@ def health():
     return jsonify({
         "ok": True,
         "camera_name": CAM_NAME,
-        "frames_ready": latest_preview_jpg is not None,
-        "frame_counter": preview_counter,
+        "frames_ready": app_output.frame is not None,
+        "frame_counter": app_output.frame_counter,
         "preview_width": PREVIEW_WIDTH,
         "preview_height": PREVIEW_HEIGHT,
         "still_width": STILL_WIDTH,
         "still_height": STILL_HEIGHT,
-        "latest_timestamp": latest_preview_ts
+        "latest_timestamp": app_output.timestamp
     })
 
 
-@app.route("/frame.jpg")
-def frame_jpg():
-    if latest_preview_jpg is None:
-        return jsonify({"ok": False, "error": "preview not ready"}), 503
-
-    resp = Response(latest_preview_jpg, mimetype="image/jpeg")
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    resp.headers["X-Timestamp"] = latest_preview_ts
-    resp.headers["X-Frame-Counter"] = str(preview_counter)
-    resp.headers["X-Camera-Name"] = CAM_NAME
-    return resp
+@app.route("/stream/rgb.mjpg")
+def stream_rgb():
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Accel-Buffering": "no",
+        "Connection": "close",
+    }
+    return Response(
+        mjpeg_generator(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers=headers,
+        direct_passthrough=True
+    )
 
 
 @app.route("/capture", methods=["POST"])
@@ -115,34 +136,38 @@ def capture():
 
     try:
         with camera_lock:
-            picam2.stop()
+            stop_preview_stream()
 
             still_config = picam2.create_still_configuration(
-                main={"size": (STILL_WIDTH, STILL_HEIGHT), "format": "RGB888"},
-                buffer_count=1
+                main={"size": (STILL_WIDTH, STILL_HEIGHT), "format": "RGB888"}
             )
             picam2.configure(still_config)
             picam2.start()
             time.sleep(0.6)
 
             frame = picam2.capture_array("main")
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             picam2.stop()
             configure_preview()
-            picam2.start()
+            start_preview_stream()
             time.sleep(0.3)
 
-        jpg = encode_jpeg(frame_bgr, JPEG_QUALITY_CAPTURE)
-        if jpg is None:
-            return jsonify({"ok": False, "error": "failed to encode full-res still"}), 500
+        # Encode still as JPEG using picamera2/libcamera path via simplebuffer? fallback to cv2 avoided.
+        # Since Flask needs bytes, use PIL here for lighter one-off encoding than per-frame streaming.
+        from PIL import Image
+        import numpy as np
+
+        img = Image.fromarray(np.asarray(frame))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY_CAPTURE)
+        jpg = buf.getvalue()
 
         resp = Response(jpg, mimetype="image/jpeg")
         resp.headers["X-Timestamp"] = ts
-        resp.headers["X-Frame-Counter"] = str(preview_counter)
+        resp.headers["X-Frame-Counter"] = str(app_output.frame_counter)
         resp.headers["X-Camera-Name"] = CAM_NAME
-        resp.headers["X-Width"] = str(frame_bgr.shape[1])
-        resp.headers["X-Height"] = str(frame_bgr.shape[0])
+        resp.headers["X-Width"] = str(frame.shape[1])
+        resp.headers["X-Height"] = str(frame.shape[0])
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
@@ -152,6 +177,4 @@ def capture():
 
 if __name__ == "__main__":
     init_camera()
-    t = threading.Thread(target=preview_loop, daemon=True)
-    t.start()
     app.run(host="0.0.0.0", port=8001, debug=False, threaded=True)
