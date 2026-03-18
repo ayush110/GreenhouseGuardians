@@ -11,9 +11,9 @@ app = Flask(__name__)
 D435_BASE = "http://172.20.10.2:8000"
 
 PI_ZERO_CAMS = {
-    "left": "http://172.20.10.4:8001",
-    "right": "http://172.20.10.5:8001",
-    "bottom": "http://172.20.10.6:8001",
+    "right": "http://172.20.10.4:8001",
+    "bottom": "http://172.20.10.5:8001",
+    "left": "http://172.20.10.6:8001",
 }
 
 SAVE_DIR = Path("captures")
