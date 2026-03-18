@@ -19,7 +19,7 @@
 struct SharedFrames {
     cv::Mat color;
     cv::Mat depth_vis;
-    rs2::depth_frame depth_raw;
+    rs2::frame depth_raw;
     std::mutex mtx;
     std::atomic<bool> ready{false};
 };
@@ -49,7 +49,8 @@ static int create_server(int port) {
         return -1;
     }
 
-    sockaddr_in addr{};
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
@@ -122,19 +123,62 @@ static std::string html_index() {
 }
 
 static bool encode_jpeg(const cv::Mat& img, std::vector<uchar>& out) {
-    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 80};
+    std::vector<int> params;
+    params.push_back(cv::IMWRITE_JPEG_QUALITY);
+    params.push_back(80);
     return cv::imencode(".jpg", img, out, params);
+}
+
+static std::string get_path(const std::string& req) {
+    size_t method_end = req.find(' ');
+    if (method_end == std::string::npos) return "/";
+    size_t path_end = req.find(' ', method_end + 1);
+    if (path_end == std::string::npos) return "/";
+    return req.substr(method_end + 1, path_end - method_end - 1);
+}
+
+static bool parse_xy(const std::string& path, int& x, int& y) {
+    size_t q = path.find('?');
+    if (q == std::string::npos) return false;
+
+    std::string query = path.substr(q + 1);
+    std::istringstream iss(query);
+    std::string token;
+    bool has_x = false;
+    bool has_y = false;
+
+    while (std::getline(iss, token, '&')) {
+        size_t eq = token.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = token.substr(0, eq);
+        std::string value = token.substr(eq + 1);
+
+        try {
+            if (key == "x") {
+                x = std::stoi(value);
+                has_x = true;
+            } else if (key == "y") {
+                y = std::stoi(value);
+                has_y = true;
+            }
+        } catch (...) {
+            return false;
+        }
+    }
+
+    return has_x && has_y;
 }
 
 static void capture_loop(SharedFrames& shared) {
     rs2::pipeline pipe;
     rs2::config cfg;
 
-    cfg.enable_stream(rs2::stream::color, 640, 480, rs2::format::bgr8, 15);
-    cfg.enable_stream(rs2::stream::depth, 640, 480, rs2::format::z16, 15);
+    cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 15);
+    cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 15);
 
-    rs2::pipeline_profile profile = pipe.start(cfg);
-    rs2::align align_to_color(rs2::stream::color);
+    pipe.start(cfg);
+
+    rs2::align align_to_color(RS2_STREAM_COLOR);
     rs2::colorizer colorizer;
 
     while (true) {
@@ -175,46 +219,7 @@ static void capture_loop(SharedFrames& shared) {
     }
 }
 
-static std::string get_path(const std::string& req) {
-    size_t method_end = req.find(' ');
-    if (method_end == std::string::npos) return "/";
-    size_t path_end = req.find(' ', method_end + 1);
-    if (path_end == std::string::npos) return "/";
-    return req.substr(method_end + 1, path_end - method_end - 1);
-}
-
-static bool parse_xy(const std::string& path, int& x, int& y) {
-    size_t q = path.find('?');
-    if (q == std::string::npos) return false;
-
-    std::string query = path.substr(q + 1);
-    std::istringstream iss(query);
-    std::string token;
-    bool has_x = false, has_y = false;
-
-    while (std::getline(iss, token, '&')) {
-        size_t eq = token.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = token.substr(0, eq);
-        std::string value = token.substr(eq + 1);
-
-        try {
-            if (key == "x") {
-                x = std::stoi(value);
-                has_x = true;
-            } else if (key == "y") {
-                y = std::stoi(value);
-                has_y = true;
-            }
-        } catch (...) {
-            return false;
-        }
-    }
-
-    return has_x && has_y;
-}
-
-static void handle_mjpeg_stream(int client_fd, const cv::Mat& frame) {
+static void stream_mjpeg(int client_fd, SharedFrames& shared, const std::string& mode) {
     std::string header =
         "HTTP/1.1 200 OK\r\n"
         "Cache-Control: no-cache\r\n"
@@ -227,8 +232,29 @@ static void handle_mjpeg_stream(int client_fd, const cv::Mat& frame) {
     }
 
     while (true) {
+        cv::Mat img;
+
+        {
+            std::lock_guard<std::mutex> lock(shared.mtx);
+
+            if (mode == "color") {
+                if (!shared.color.empty()) img = shared.color.clone();
+            } else if (mode == "depth") {
+                if (!shared.depth_vis.empty()) img = shared.depth_vis.clone();
+            } else if (mode == "combined") {
+                if (!shared.color.empty() && !shared.depth_vis.empty()) {
+                    cv::hconcat(shared.color, shared.depth_vis, img);
+                }
+            }
+        }
+
+        if (img.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            continue;
+        }
+
         std::vector<uchar> jpg;
-        if (!encode_jpeg(frame, jpg)) {
+        if (!encode_jpeg(img, jpg)) {
             break;
         }
 
@@ -236,6 +262,7 @@ static void handle_mjpeg_stream(int client_fd, const cv::Mat& frame) {
         part << "--frame\r\n"
              << "Content-Type: image/jpeg\r\n"
              << "Content-Length: " << jpg.size() << "\r\n\r\n";
+
         std::string part_header = part.str();
 
         if (!send_all(client_fd, part_header.c_str(), part_header.size()) ||
@@ -275,63 +302,28 @@ static void client_thread(int client_fd, SharedFrames& shared) {
         return;
     }
 
-    if (path == "/color" || path == "/depth" || path == "/combined") {
-        std::string header =
-            "HTTP/1.1 200 OK\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Pragma: no-cache\r\n"
-            "Connection: close\r\n"
-            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+    if (path == "/color") {
+        stream_mjpeg(client_fd, shared, "color");
+        close(client_fd);
+        return;
+    }
 
-        if (!send_all(client_fd, header.c_str(), header.size())) {
-            close(client_fd);
-            return;
-        }
+    if (path == "/depth") {
+        stream_mjpeg(client_fd, shared, "depth");
+        close(client_fd);
+        return;
+    }
 
-        while (true) {
-            cv::Mat img;
-            {
-                std::lock_guard<std::mutex> lock(shared.mtx);
-                if (path == "/color") {
-                    img = shared.color.clone();
-                } else if (path == "/depth") {
-                    img = shared.depth_vis.clone();
-                } else {
-                    cv::hconcat(shared.color, shared.depth_vis, img);
-                }
-            }
-
-            if (img.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                continue;
-            }
-
-            std::vector<uchar> jpg;
-            if (!encode_jpeg(img, jpg)) {
-                break;
-            }
-
-            std::ostringstream part;
-            part << "--frame\r\n"
-                 << "Content-Type: image/jpeg\r\n"
-                 << "Content-Length: " << jpg.size() << "\r\n\r\n";
-            std::string part_header = part.str();
-
-            if (!send_all(client_fd, part_header.c_str(), part_header.size()) ||
-                !send_all(client_fd, jpg.data(), jpg.size()) ||
-                !send_all(client_fd, "\r\n", 2)) {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(66));
-        }
-
+    if (path == "/combined") {
+        stream_mjpeg(client_fd, shared, "combined");
         close(client_fd);
         return;
     }
 
     if (path.rfind("/depth_value", 0) == 0) {
-        int x = 0, y = 0;
+        int x = 0;
+        int y = 0;
+
         if (!parse_xy(path, x, y)) {
             std::string resp = http_bad_request("Use /depth_value?x=320&y=240");
             send_all(client_fd, resp.c_str(), resp.size());
@@ -340,12 +332,15 @@ static void client_thread(int client_fd, SharedFrames& shared) {
         }
 
         float depth_m = -1.0f;
-        int width = 0, height = 0;
+        int width = 0;
+        int height = 0;
 
         {
             std::lock_guard<std::mutex> lock(shared.mtx);
-            width = shared.depth_raw.get_width();
-            height = shared.depth_raw.get_height();
+
+            rs2::depth_frame df = shared.depth_raw.as<rs2::depth_frame>();
+            width = df.get_width();
+            height = df.get_height();
 
             if (x < 0 || y < 0 || x >= width || y >= height) {
                 std::ostringstream oss;
@@ -357,7 +352,7 @@ static void client_thread(int client_fd, SharedFrames& shared) {
                 return;
             }
 
-            depth_m = shared.depth_raw.get_distance(x, y);
+            depth_m = df.get_distance(x, y);
         }
 
         std::ostringstream body;
@@ -398,7 +393,7 @@ int main() {
         std::cout << "  http://<PI4_IP>:8080/depth_value?x=320&y=240\n";
 
         while (true) {
-            sockaddr_in client_addr{};
+            sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
             if (client_fd < 0) {
