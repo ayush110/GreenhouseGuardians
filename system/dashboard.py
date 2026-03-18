@@ -8,8 +8,8 @@ import numpy as np
 
 app = Flask(__name__)
 
-D435_BASE = "http://192.168.1.20:8000"     # change
-PI_ZERO_BASE = "http://192.168.1.21:8001"  # change
+D435_BASE = "http://172.20.10.2:8000"     # change
+PI_ZERO_BASE = "http://172.20.10.4:8001"  # change
 
 SAVE_DIR = Path("captures")
 SAVE_DIR.mkdir(exist_ok=True)
