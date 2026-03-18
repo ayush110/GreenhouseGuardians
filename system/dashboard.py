@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify, Response
+from flask import Flask, render_template_string, jsonify
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -8,8 +8,8 @@ import numpy as np
 
 app = Flask(__name__)
 
-D435_BASE = "http://172.20.10.2:8000"     # change
-PI_ZERO_BASE = "http://172.20.10.4:8001"  # change
+D435_BASE = "http://172.20.10.2:8000"
+PI_ZERO_BASE = "http://172.20.10.4:8001"
 
 SAVE_DIR = Path("captures")
 SAVE_DIR.mkdir(exist_ok=True)
@@ -98,15 +98,15 @@ HTML = """
     <div class="grid">
         <div class="card">
             <h3>D435 RGB</h3>
-            <img src="/proxy/d435/rgb.mjpg" />
+            <img id="d435rgb" src="{{ d435_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
         </div>
         <div class="card">
             <h3>D435 Depth</h3>
-            <img src="/proxy/d435/depth.mjpg" />
+            <img id="d435depth" src="{{ d435_base }}/stream/depth.mjpg?ts={{ now_ts }}" />
         </div>
         <div class="card">
             <h3>Pi Zero RGB</h3>
-            <img src="/proxy/pizero/rgb.mjpg" />
+            <img id="pizero" src="{{ pi_zero_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
         </div>
     </div>
 
@@ -125,7 +125,7 @@ HTML = """
                 if (data.ok) {
                     status.textContent = "Saved round: " + data.timestamp;
                 } else {
-                    status.textContent = "Capture failed: " + (data.error || "unknown");
+                    status.textContent = "Capture failed: " + (data.error || "partial failure");
                 }
             } catch (err) {
                 status.textContent = "Capture error: " + err;
@@ -140,64 +140,59 @@ HTML = """
                 const res = await fetch("/health_all");
                 const data = await res.json();
                 healthBox.textContent = JSON.stringify(data, null, 2);
-                if (data.ok) {
-                    status.textContent = "Health OK.";
-                } else {
-                    status.textContent = "Some devices unavailable.";
-                }
+                status.textContent = data.ok ? "Health OK." : "Some devices unavailable.";
             } catch (err) {
                 status.textContent = "Health error: " + err;
             }
         }
+
+        function reloadStreams() {
+            const ts = Date.now();
+            document.getElementById("d435rgb").src = "{{ d435_base }}/stream/rgb.mjpg?ts=" + ts;
+            document.getElementById("d435depth").src = "{{ d435_base }}/stream/depth.mjpg?ts=" + ts;
+            document.getElementById("pizero").src = "{{ pi_zero_base }}/stream/rgb.mjpg?ts=" + ts;
+        }
+
+        window.addEventListener("load", () => {
+            checkHealth();
+            setInterval(checkHealth, 5000);
+        });
     </script>
 </body>
 </html>
 """
 
-def stream_proxy(url: str, content_type: str):
-    upstream = requests.get(url, stream=True, timeout=(5, 60))
-    headers = {
-        "Content-Type": content_type,
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-    return Response(upstream.iter_content(chunk_size=4096), headers=headers)
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, d435_base=D435_BASE, pi_zero_base=PI_ZERO_BASE)
+    return render_template_string(
+        HTML,
+        d435_base=D435_BASE,
+        pi_zero_base=PI_ZERO_BASE,
+        now_ts=int(datetime.now().timestamp())
+    )
 
-@app.route("/proxy/d435/rgb.mjpg")
-def proxy_d435_rgb():
-    return stream_proxy(f"{D435_BASE}/stream/rgb.mjpg", "multipart/x-mixed-replace; boundary=frame")
-
-@app.route("/proxy/d435/depth.mjpg")
-def proxy_d435_depth():
-    return stream_proxy(f"{D435_BASE}/stream/depth.mjpg", "multipart/x-mixed-replace; boundary=frame")
-
-@app.route("/proxy/pizero/rgb.mjpg")
-def proxy_pizero_rgb():
-    return stream_proxy(f"{PI_ZERO_BASE}/stream/rgb.mjpg", "multipart/x-mixed-replace; boundary=frame")
 
 @app.route("/health_all")
 def health_all():
     out = {"ok": True}
 
     try:
-        r = requests.get(f"{D435_BASE}/health", timeout=5)
+        r = requests.get(f"{D435_BASE}/health", timeout=3)
         out["d435"] = r.json()
     except Exception as e:
         out["ok"] = False
         out["d435"] = {"ok": False, "error": str(e)}
 
     try:
-        r = requests.get(f"{PI_ZERO_BASE}/health", timeout=5)
+        r = requests.get(f"{PI_ZERO_BASE}/health", timeout=3)
         out["pi_zero"] = r.json()
     except Exception as e:
         out["ok"] = False
         out["pi_zero"] = {"ok": False, "error": str(e)}
 
     return jsonify(out)
+
 
 @app.route("/capture_all", methods=["POST"])
 def capture_all():
@@ -213,7 +208,7 @@ def capture_all():
 
     # Capture D435
     try:
-        r = requests.post(f"{D435_BASE}/capture", timeout=15)
+        r = requests.post(f"{D435_BASE}/capture", timeout=20)
         if r.status_code != 200:
             raise RuntimeError(f"D435 capture failed with status {r.status_code}")
 
@@ -253,8 +248,8 @@ def capture_all():
             "timestamp": d435_ts,
             "frame_counter": frame_counter,
             "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
-            "depth_dtype": str(depth_img.dtype),
-            "depth_shape": list(depth_img.shape),
+            "depth_dtype": str(depth_img.dtype) if depth_img is not None else None,
+            "depth_shape": list(depth_img.shape) if depth_img is not None else None,
             "depth_scale_m_per_unit": depth_scale,
             "intrinsics": {
                 "fx": fx,
@@ -317,6 +312,7 @@ def capture_all():
         result["pi_zero_error"] = str(e)
 
     return jsonify(result)
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=True, threaded=True)
