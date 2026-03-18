@@ -8,11 +8,21 @@ import threading
 app = Flask(__name__)
 
 CAM_NAME = "pi_zero_cam"
-WIDTH = 640
-HEIGHT = 480
-JPEG_QUALITY_CAPTURE = 90
-JPEG_QUALITY_STREAM = 55
-FRAME_INTERVAL_SEC = 0.05  # ~20 FPS max
+
+# Live preview resolution for dashboard
+PREVIEW_WIDTH = 1280
+PREVIEW_HEIGHT = 720
+
+# Full-resolution still capture
+STILL_WIDTH = 4608
+STILL_HEIGHT = 2592
+
+# JPEG settings
+JPEG_QUALITY_CAPTURE = 95
+JPEG_QUALITY_STREAM = 60
+
+# Limit preview FPS a bit to reduce lag on Pi Zero 2 W
+FRAME_INTERVAL_SEC = 0.07
 
 picam2 = Picamera2()
 camera_lock = threading.Lock()
@@ -27,12 +37,22 @@ def timestamp_now():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
-def init_camera():
-    global picam2
-    config = picam2.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT), "format": "RGB888"}
+def encode_jpeg(img, quality=80):
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return buf.tobytes()
+
+
+def configure_preview():
+    preview_config = picam2.create_video_configuration(
+        main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
     )
-    picam2.configure(config)
+    picam2.configure(preview_config)
+
+
+def init_camera():
+    configure_preview()
     picam2.start()
     time.sleep(2)
 
@@ -58,13 +78,6 @@ def capture_loop():
             time.sleep(0.2)
 
 
-def encode_jpeg(img, quality=80):
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        return None
-    return buf.tobytes()
-
-
 def mjpeg_generator():
     global latest_frame, frame_counter, latest_timestamp
     last_seen = -1
@@ -83,9 +96,9 @@ def mjpeg_generator():
             cv2.putText(
                 frame,
                 f"{CAM_NAME}  {ts}  fc={fc}",
-                (10, 28),
+                (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.7,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA
@@ -117,8 +130,10 @@ def health():
         "camera_name": CAM_NAME,
         "frames_ready": latest_frame is not None,
         "frame_counter": frame_counter,
-        "width": WIDTH,
-        "height": HEIGHT,
+        "preview_width": PREVIEW_WIDTH,
+        "preview_height": PREVIEW_HEIGHT,
+        "still_width": STILL_WIDTH,
+        "still_height": STILL_HEIGHT,
         "latest_timestamp": latest_timestamp
     })
 
@@ -144,25 +159,45 @@ def stream_rgb():
 def capture():
     global latest_frame, latest_timestamp, frame_counter
 
-    if latest_frame is None:
-        return jsonify({"ok": False, "error": "frames not ready"}), 503
+    ts = timestamp_now()
 
-    frame = latest_frame.copy()
-    ts = latest_timestamp
-    fc = frame_counter
+    try:
+        with camera_lock:
+            # Stop preview mode
+            picam2.stop()
 
-    jpg = encode_jpeg(frame, JPEG_QUALITY_CAPTURE)
-    if jpg is None:
-        return jsonify({"ok": False, "error": "failed to encode image"}), 500
+            # Switch to full-res still mode
+            still_config = picam2.create_still_configuration(
+                main={"size": (STILL_WIDTH, STILL_HEIGHT), "format": "RGB888"}
+            )
+            picam2.configure(still_config)
+            picam2.start()
+            time.sleep(0.6)
 
-    resp = Response(jpg, mimetype="image/jpeg")
-    resp.headers["X-Timestamp"] = ts
-    resp.headers["X-Frame-Counter"] = str(fc)
-    resp.headers["X-Camera-Name"] = CAM_NAME
-    resp.headers["X-Width"] = str(frame.shape[1])
-    resp.headers["X-Height"] = str(frame.shape[0])
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
+            frame = picam2.capture_array()
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            # Switch back to preview mode
+            picam2.stop()
+            configure_preview()
+            picam2.start()
+            time.sleep(0.3)
+
+        jpg = encode_jpeg(frame_bgr, JPEG_QUALITY_CAPTURE)
+        if jpg is None:
+            return jsonify({"ok": False, "error": "failed to encode image"}), 500
+
+        resp = Response(jpg, mimetype="image/jpeg")
+        resp.headers["X-Timestamp"] = ts
+        resp.headers["X-Frame-Counter"] = str(frame_counter)
+        resp.headers["X-Camera-Name"] = CAM_NAME
+        resp.headers["X-Width"] = str(frame_bgr.shape[1])
+        resp.headers["X-Height"] = str(frame_bgr.shape[0])
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
