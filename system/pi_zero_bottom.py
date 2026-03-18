@@ -9,7 +9,7 @@ import io
 
 app = Flask(__name__)
 
-CAM_NAME = "pi_zero_cam"
+CAM_NAME = "pi_zero_bottom"
 
 # Preview stream resolution
 PREVIEW_WIDTH = 960

@@ -9,7 +9,12 @@ import numpy as np
 app = Flask(__name__)
 
 D435_BASE = "http://172.20.10.2:8000"
-PI_ZERO_BASE = "http://172.20.10.4:8001"
+
+PI_ZERO_CAMS = {
+    "left": "http://172.20.10.4:8001",
+    "right": "http://172.20.10.5:8001",
+    "bottom": "http://172.20.10.6:8001",
+}
 
 SAVE_DIR = Path("captures")
 SAVE_DIR.mkdir(exist_ok=True)
@@ -73,6 +78,7 @@ HTML = """
         .small {
             color: #6b7280;
             font-size: 14px;
+            margin-bottom: 4px;
         }
         pre {
             white-space: pre-wrap;
@@ -86,8 +92,11 @@ HTML = """
 </head>
 <body>
     <h1>Multi-Camera Dashboard</h1>
+
     <div class="small">D435: <code>{{ d435_base }}</code></div>
-    <div class="small">Pi Zero: <code>{{ pi_zero_base }}</code></div>
+    <div class="small">Pi Zero Left: <code>{{ pi_zero_cams["left"] }}</code></div>
+    <div class="small">Pi Zero Right: <code>{{ pi_zero_cams["right"] }}</code></div>
+    <div class="small">Pi Zero Bottom: <code>{{ pi_zero_cams["bottom"] }}</code></div>
 
     <div class="topbar">
         <button class="btn" onclick="captureAll()">Capture All</button>
@@ -100,13 +109,25 @@ HTML = """
             <h3>D435 RGB</h3>
             <img id="d435rgb" src="{{ d435_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
         </div>
+
         <div class="card">
             <h3>D435 Depth</h3>
             <img id="d435depth" src="{{ d435_base }}/stream/depth.mjpg?ts={{ now_ts }}" />
         </div>
+
         <div class="card">
-            <h3>Pi Zero RGB</h3>
-            <img id="pizero" src="{{ pi_zero_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+            <h3>Pi Zero Left</h3>
+            <img id="pi_left" src="{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+        </div>
+
+        <div class="card">
+            <h3>Pi Zero Right</h3>
+            <img id="pi_right" src="{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+        </div>
+
+        <div class="card">
+            <h3>Pi Zero Bottom</h3>
+            <img id="pi_bottom" src="{{ pi_zero_cams['bottom'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
         </div>
     </div>
 
@@ -124,8 +145,10 @@ HTML = """
                 const data = await res.json();
                 if (data.ok) {
                     status.textContent = "Saved round: " + data.timestamp;
+                    reloadStreams();
                 } else {
-                    status.textContent = "Capture failed: " + (data.error || "partial failure");
+                    status.textContent = "Capture finished with errors. Saved round: " + data.timestamp;
+                    reloadStreams();
                 }
             } catch (err) {
                 status.textContent = "Capture error: " + err;
@@ -150,7 +173,9 @@ HTML = """
             const ts = Date.now();
             document.getElementById("d435rgb").src = "{{ d435_base }}/stream/rgb.mjpg?ts=" + ts;
             document.getElementById("d435depth").src = "{{ d435_base }}/stream/depth.mjpg?ts=" + ts;
-            document.getElementById("pizero").src = "{{ pi_zero_base }}/stream/rgb.mjpg?ts=" + ts;
+            document.getElementById("pi_left").src = "{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts=" + ts;
+            document.getElementById("pi_right").src = "{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts=" + ts;
+            document.getElementById("pi_bottom").src = "{{ pi_zero_cams['bottom'] }}/stream/rgb.mjpg?ts=" + ts;
         }
 
         window.addEventListener("load", () => {
@@ -168,15 +193,20 @@ def index():
     return render_template_string(
         HTML,
         d435_base=D435_BASE,
-        pi_zero_base=PI_ZERO_BASE,
+        pi_zero_cams=PI_ZERO_CAMS,
         now_ts=int(datetime.now().timestamp())
     )
 
 
 @app.route("/health_all")
 def health_all():
-    out = {"ok": True}
+    out = {
+        "ok": True,
+        "d435": {},
+        "pi_zeros": {}
+    }
 
+    # D435 health
     try:
         r = requests.get(f"{D435_BASE}/health", timeout=3)
         out["d435"] = r.json()
@@ -184,12 +214,14 @@ def health_all():
         out["ok"] = False
         out["d435"] = {"ok": False, "error": str(e)}
 
-    try:
-        r = requests.get(f"{PI_ZERO_BASE}/health", timeout=3)
-        out["pi_zero"] = r.json()
-    except Exception as e:
-        out["ok"] = False
-        out["pi_zero"] = {"ok": False, "error": str(e)}
+    # Pi Zero health
+    for cam_name, base_url in PI_ZERO_CAMS.items():
+        try:
+            r = requests.get(f"{base_url}/health", timeout=3)
+            out["pi_zeros"][cam_name] = r.json()
+        except Exception as e:
+            out["ok"] = False
+            out["pi_zeros"][cam_name] = {"ok": False, "error": str(e)}
 
     return jsonify(out)
 
@@ -206,7 +238,9 @@ def capture_all():
         "saved": {}
     }
 
-    # Capture D435
+    # -----------------------------
+    # Capture D435 (UNCHANGED)
+    # -----------------------------
     try:
         r = requests.post(f"{D435_BASE}/capture", timeout=20)
         if r.status_code != 200:
@@ -273,43 +307,49 @@ def capture_all():
         result["ok"] = False
         result["d435_error"] = str(e)
 
-    # Capture Pi Zero
-    try:
-        r = requests.post(f"{PI_ZERO_BASE}/capture", timeout=10)
-        if r.status_code != 200:
-            raise RuntimeError(f"Pi Zero capture failed with status {r.status_code}")
+    # -----------------------------
+    # Capture all Pi Zeros
+    # -----------------------------
+    result["saved"]["pi_zeros"] = {}
 
-        pi_ts = r.headers.get("X-Timestamp", timestamp)
-        frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
-        cam_name = r.headers.get("X-Camera-Name", "pi_zero")
-        width = int(r.headers.get("X-Width", "0"))
-        height = int(r.headers.get("X-Height", "0"))
+    for cam_name, base_url in PI_ZERO_CAMS.items():
+        try:
+            r = requests.post(f"{base_url}/capture", timeout=15)
+            if r.status_code != 200:
+                raise RuntimeError(f"{cam_name} capture failed with status {r.status_code}")
 
-        pi_dir = round_dir / cam_name
-        pi_dir.mkdir(exist_ok=True)
+            pi_ts = r.headers.get("X-Timestamp", timestamp)
+            frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
+            returned_cam_name = r.headers.get("X-Camera-Name", cam_name)
+            width = int(r.headers.get("X-Width", "0"))
+            height = int(r.headers.get("X-Height", "0"))
 
-        img_path = pi_dir / "rgb.jpg"
-        meta_path = pi_dir / "meta.json"
+            pi_dir = round_dir / cam_name
+            pi_dir.mkdir(exist_ok=True)
 
-        img_path.write_bytes(r.content)
+            img_path = pi_dir / "rgb.jpg"
+            meta_path = pi_dir / "meta.json"
 
-        meta = {
-            "timestamp": pi_ts,
-            "frame_counter": frame_counter,
-            "camera_name": cam_name,
-            "width": width,
-            "height": height
-        }
-        meta_path.write_text(json.dumps(meta, indent=2))
+            img_path.write_bytes(r.content)
 
-        result["saved"]["pi_zero"] = {
-            "rgb_path": str(img_path),
-            "meta_path": str(meta_path),
-        }
+            meta = {
+                "timestamp": pi_ts,
+                "frame_counter": frame_counter,
+                "camera_name": returned_cam_name,
+                "width": width,
+                "height": height,
+                "base_url": base_url
+            }
+            meta_path.write_text(json.dumps(meta, indent=2))
 
-    except Exception as e:
-        result["ok"] = False
-        result["pi_zero_error"] = str(e)
+            result["saved"]["pi_zeros"][cam_name] = {
+                "rgb_path": str(img_path),
+                "meta_path": str(meta_path),
+            }
+
+        except Exception as e:
+            result["ok"] = False
+            result[f"{cam_name}_error"] = str(e)
 
     return jsonify(result)
 
