@@ -2,6 +2,9 @@ from flask import Flask, render_template_string, jsonify, Response
 import requests
 from pathlib import Path
 from datetime import datetime
+import json
+import cv2
+import numpy as np
 
 app = Flask(__name__)
 
@@ -26,6 +29,7 @@ HTML = """
             align-items: center;
             gap: 14px;
             margin-bottom: 20px;
+            flex-wrap: wrap;
         }
         .btn {
             background: #2563eb;
@@ -68,6 +72,14 @@ HTML = """
             color: #6b7280;
             font-size: 14px;
         }
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background: #f8fafc;
+            border-radius: 8px;
+            padding: 10px;
+            border: 1px solid #e5e7eb;
+        }
     </style>
 </head>
 <body>
@@ -91,6 +103,11 @@ HTML = """
         </div>
     </div>
 
+    <div class="card" style="margin-top:20px;">
+        <h3>Latest Health</h3>
+        <pre id="healthBox">No data yet.</pre>
+    </div>
+
     <script>
         async function captureNow() {
             const status = document.getElementById("status");
@@ -110,12 +127,14 @@ HTML = """
 
         async function checkHealth() {
             const status = document.getElementById("status");
+            const healthBox = document.getElementById("healthBox");
             status.textContent = "Checking health...";
             try {
                 const res = await fetch("/health");
                 const data = await res.json();
+                healthBox.textContent = JSON.stringify(data, null, 2);
                 if (data.ok) {
-                    status.textContent = "Pi healthy. frames_ready=" + data.frames_ready;
+                    status.textContent = "Pi reachable.";
                 } else {
                     status.textContent = "Health failed.";
                 }
@@ -163,10 +182,21 @@ def capture():
         r = requests.post(f"{PI4_BASE}/capture", timeout=15)
 
         if r.status_code != 200:
-            return jsonify({"ok": False, "error": f"Pi returned status {r.status_code}"}), 500
+            try:
+                return jsonify(r.json()), r.status_code
+            except Exception:
+                return jsonify({"ok": False, "error": f"Pi returned status {r.status_code}"}), 500
 
         ts = r.headers.get("X-Timestamp", datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
+        frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
         rgb_size = int(r.headers.get("X-RGB-Size", "0"))
+        depth_scale = float(r.headers.get("X-Depth-Scale", "0"))
+        fx = float(r.headers.get("X-FX", "0"))
+        fy = float(r.headers.get("X-FY", "0"))
+        cx = float(r.headers.get("X-CX", "0"))
+        cy = float(r.headers.get("X-CY", "0"))
+        width = int(r.headers.get("X-Width", "0"))
+        height = int(r.headers.get("X-Height", "0"))
 
         payload = r.content
         if rgb_size <= 0 or rgb_size >= len(payload):
@@ -180,15 +210,43 @@ def capture():
 
         rgb_path = round_dir / "rgb.jpg"
         depth_path = round_dir / "depth_raw.png"
+        npy_path = round_dir / "depth_raw.npy"
+        meta_path = round_dir / "meta.json"
 
         rgb_path.write_bytes(rgb_bytes)
         depth_path.write_bytes(depth_png_bytes)
+
+        depth_img = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth_img is None:
+            return jsonify({"ok": False, "error": "Failed to reload saved depth PNG"}), 500
+
+        np.save(npy_path, depth_img)
+
+        meta = {
+            "timestamp": ts,
+            "frame_counter": frame_counter,
+            "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
+            "depth_dtype": str(depth_img.dtype),
+            "depth_shape": list(depth_img.shape),
+            "depth_scale_m_per_unit": depth_scale,
+            "intrinsics": {
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+                "width": width,
+                "height": height
+            }
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
 
         return jsonify({
             "ok": True,
             "timestamp": ts,
             "rgb_path": str(rgb_path),
             "depth_path": str(depth_path),
+            "npy_path": str(npy_path),
+            "meta_path": str(meta_path),
         })
 
     except Exception as e:
