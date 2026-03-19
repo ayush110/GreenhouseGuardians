@@ -1,7 +1,7 @@
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import cv2
 import numpy as np
@@ -18,11 +18,14 @@ PI_ZERO_CAMS = {
     "bottom": "http://172.20.10.5:8001",
 }
 
+API_BASE = "https://kayenm-greenhouseguardians.hf.space/api/upload"
+
 SAVE_DIR = Path.home() / "multi_camera_captures"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 HTTP = requests.Session()
-HTTP.mount("http://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
+HTTP.mount("http://",  requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
+HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 
 HTML = """
 <!doctype html>
@@ -89,6 +92,24 @@ HTML = """
             padding: 10px;
             border: 1px solid #e5e7eb;
         }
+        .field-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .field-row label {
+            font-size: 14px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .field-row input {
+            padding: 8px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            width: 110px;
+        }
     </style>
 </head>
 <body>
@@ -98,6 +119,16 @@ HTML = """
     <div class="small">Pi Zero Left: <code>{{ pi_zero_cams["left"] }}</code></div>
     <div class="small">Pi Zero Right: <code>{{ pi_zero_cams["right"] }}</code></div>
     <div class="small">Pi Zero Bottom: <code>{{ pi_zero_cams["bottom"] }}</code></div>
+
+    <div class="card" style="margin: 16px 0;">
+        <h3 style="margin-top:0;">Capture Settings</h3>
+        <div class="field-row">
+            <label for="greenhouse_row">Greenhouse Row</label>
+            <input type="number" id="greenhouse_row" value="1" min="1" step="1" />
+            <label for="distance_from_start">Distance from Start (m)</label>
+            <input type="number" id="distance_from_start" value="0.0" min="0" step="0.1" />
+        </div>
+    </div>
 
     <div class="topbar">
         <button class="btn" onclick="captureAll()">Capture All</button>
@@ -136,9 +167,21 @@ HTML = """
     <script>
         async function captureAll() {
             const status = document.getElementById("status");
+            const greenhouse_row = parseInt(document.getElementById("greenhouse_row").value, 10);
+            const distanceFromRowStart = parseFloat(document.getElementById("distance_from_start").value);
+
+            if (isNaN(greenhouse_row) || isNaN(distanceFromRowStart)) {
+                status.textContent = "Please enter valid row and distance values.";
+                return;
+            }
+
             status.textContent = "Capturing all cameras...";
             try {
-                const res = await fetch("/capture_all", { method: "POST" });
+                const res = await fetch("/capture_all", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ greenhouse_row, distanceFromRowStart }),
+                });
                 const data = await res.json();
                 if (data.ok) {
                     status.textContent = "Saved: " + data.timestamp + " → " + data.save_dir;
@@ -315,9 +358,74 @@ def capture_pi_zero(cam_name: str, base_url: str, round_dir: Path, trigger_at_ms
     }
 
 
+def _fmt_ts(dt: datetime) -> str:
+    """Format datetime as 2026-03-19T06:14:02.973Z (UTC, 3 decimal places)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def upload_rgb_pair(saved: dict, greenhouse_row: int, distance: float, timestamp: str):
+    """POST left + right Pi Zero images to /uploadData."""
+    files = []
+    for side in ("left", "right"):
+        info = saved["pi_zeros"].get(side)
+        if info and info.get("rgb_path"):
+            p = Path(info["rgb_path"])
+            files.append(("images", (p.name, p.read_bytes(), "image/jpeg")))
+
+    if not files:
+        raise RuntimeError("No left/right images available to upload")
+
+    r = HTTP.post(
+        f"{API_BASE}/uploadData",
+        files=files,
+        data={"timestamp": timestamp, "greenhouse_row": greenhouse_row, "distanceFromRowStart": distance},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def upload_d435_data(saved: dict, greenhouse_row: int, distance: float, timestamp: str):
+    """POST D435 RGB + depth .npy with intrinsics to /uploadData."""
+    d435_info = saved.get("d435")
+    if not d435_info:
+        raise RuntimeError("No D435 capture data available to upload")
+
+    meta = json.loads(Path(d435_info["meta_path"]).read_text())
+    rgb_path = Path(d435_info["rgb_path"])
+    npy_path = Path(d435_info["npy_path"])
+
+    r = HTTP.post(
+        f"{API_BASE}/uploadData",
+        files=[
+            ("images",      (rgb_path.name, rgb_path.read_bytes(), "image/jpeg")),
+            ("depth_image", (npy_path.name, npy_path.read_bytes(), "application/octet-stream")),
+        ],
+        data={
+            "timestamp":           timestamp,
+            "greenhouse_row":      greenhouse_row,
+            "distanceFromRowStart": distance,
+            "fx":          meta["intrinsics"]["fx"],
+            "fy":          meta["intrinsics"]["fy"],
+            "depth_scale": meta["depth_scale_m_per_unit"],
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 @app.route("/capture_all", methods=["POST"])
 def capture_all():
-    round_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    body = request.get_json(silent=True) or {}
+    greenhouse_row = int(body.get("greenhouse_row", 1))
+    distance = float(body.get("distanceFromRowStart", 0.0))
+
+    now = datetime.now(timezone.utc)
+    round_timestamp   = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]      # safe for dir names
+    api_ts_rgb  = _fmt_ts(now)                                      # e.g. 2026-03-19T06:14:02.973Z
+    api_ts_d435 = _fmt_ts(now + timedelta(seconds=1))               # +1 s to avoid same-key overwrite
+
     round_dir = SAVE_DIR / round_timestamp
     round_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,9 +436,13 @@ def capture_all():
         "timestamp": round_timestamp,
         "trigger_at_ms": trigger_at_ms,
         "save_dir": str(round_dir),
+        "greenhouse_row": greenhouse_row,
+        "distanceFromRowStart": distance,
         "saved": {"d435": None, "pi_zeros": {}},
+        "uploads": {},
     }
 
+    # --- Phase 1: capture all cameras in parallel ---
     futures = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures[executor.submit(capture_d435, round_dir, trigger_at_ms)] = ("d435", "d435")
@@ -348,6 +460,23 @@ def capture_all():
             except Exception as e:
                 result["ok"] = False
                 result[f"{name}_error"] = str(e)
+
+    # --- Phase 2: two sequential uploads with offset timestamps ---
+    try:
+        result["uploads"]["rgb_pair"] = upload_rgb_pair(
+            result["saved"], greenhouse_row, distance, api_ts_rgb
+        )
+    except Exception as e:
+        result["ok"] = False
+        result["uploads"]["rgb_pair_error"] = str(e)
+
+    try:
+        result["uploads"]["d435"] = upload_d435_data(
+            result["saved"], greenhouse_row, distance, api_ts_d435
+        )
+    except Exception as e:
+        result["ok"] = False
+        result["uploads"]["d435_error"] = str(e)
 
     (round_dir / "capture_summary.json").write_text(json.dumps(result, indent=2))
 
