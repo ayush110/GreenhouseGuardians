@@ -13,9 +13,8 @@ app = Flask(__name__)
 D435_BASE = "http://172.20.10.2:8000"
 
 PI_ZERO_CAMS = {
-    "left":   "http://172.20.10.7:8001",
-    "right":  "http://172.20.10.4:8001",
-    "bottom": "http://172.20.10.5:8001",
+    "left":  "http://172.20.10.7:8001",
+    "right": "http://172.20.10.4:8001",
 }
 
 API_BASE = "https://kayenm-greenhouseguardians.hf.space/api/upload"
@@ -31,197 +30,348 @@ HTML = """
 <!doctype html>
 <html>
 <head>
-    <title>Multi-Camera Dashboard</title>
+    <meta charset="utf-8" />
+    <title>Greenhouse Guardians</title>
     <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
-            font-family: Arial, sans-serif;
-            margin: 24px;
-            background: #f5f7fb;
-            color: #111827;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0d0f14;
+            color: #e2e8f0;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
+
+        /* ── Top bar ── */
         .topbar {
             display: flex;
             align-items: center;
-            gap: 14px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
+            gap: 10px;
+            padding: 0 16px;
+            height: 52px;
+            background: #13151e;
+            border-bottom: 1px solid #1f2235;
+            flex-shrink: 0;
         }
-        .btn {
-            background: #2563eb;
-            color: white;
-            border: none;
-            padding: 10px 16px;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 15px;
-        }
-        .btn:hover { background: #1d4ed8; }
-        .status { font-weight: 600; }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
-            gap: 20px;
-        }
-        .card {
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
-            padding: 16px;
-        }
-        img {
-            width: 100%;
-            border-radius: 10px;
-            border: 1px solid #d1d5db;
-            background: #e5e7eb;
-        }
-        code {
-            background: #eef2ff;
-            padding: 2px 6px;
-            border-radius: 6px;
-        }
-        .small {
-            color: #6b7280;
+
+        .logo {
             font-size: 14px;
-            margin-bottom: 4px;
+            font-weight: 700;
+            color: #4ade80;
+            letter-spacing: 0.02em;
+            white-space: nowrap;
+            margin-right: 4px;
         }
-        pre {
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            background: #f8fafc;
-            border-radius: 8px;
-            padding: 10px;
-            border: 1px solid #e5e7eb;
+
+        .sep {
+            width: 1px;
+            height: 20px;
+            background: #1f2235;
+            flex-shrink: 0;
         }
-        .field-row {
+
+        .field {
             display: flex;
             align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
+            gap: 6px;
         }
-        .field-row label {
-            font-size: 14px;
+        .field label {
+            font-size: 11px;
+            font-weight: 500;
+            color: #64748b;
+            white-space: nowrap;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+        .field input {
+            background: #1a1d2b;
+            border: 1px solid #2a2e45;
+            color: #e2e8f0;
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 13px;
+            width: 68px;
+            transition: border-color 0.15s;
+        }
+        .field input:focus {
+            outline: none;
+            border-color: #4ade80;
+        }
+
+        .btn {
+            padding: 6px 16px;
+            border-radius: 6px;
+            border: none;
+            font-size: 12px;
             font-weight: 600;
+            cursor: pointer;
+            letter-spacing: 0.03em;
+            transition: opacity 0.15s, transform 0.1s;
             white-space: nowrap;
         }
-        .field-row input {
-            padding: 8px 10px;
-            border: 1px solid #d1d5db;
-            border-radius: 8px;
-            font-size: 14px;
-            width: 110px;
+        .btn:active { transform: scale(0.97); }
+        .btn-capture { background: #4ade80; color: #0d0f14; }
+        .btn-capture:hover { background: #22c55e; }
+        .btn-health {
+            background: transparent;
+            color: #64748b;
+            border: 1px solid #2a2e45;
         }
+        .btn-health:hover { border-color: #4ade80; color: #4ade80; }
+
+        .status-wrap {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            overflow: hidden;
+        }
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #4ade80;
+            flex-shrink: 0;
+            transition: background 0.3s;
+        }
+        .status-dot.busy { background: #fbbf24; }
+        .status-dot.error { background: #f87171; }
+        #statusText {
+            font-size: 12px;
+            color: #475569;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 340px;
+        }
+
+        /* ── Stream grid ── */
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 6px;
+            padding: 6px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .card {
+            background: #13151e;
+            border-radius: 8px;
+            border: 1px solid #1f2235;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 10px;
+            flex-shrink: 0;
+            border-bottom: 1px solid #1f2235;
+        }
+        .card-title {
+            font-size: 10px;
+            font-weight: 600;
+            color: #475569;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .pill {
+            font-size: 9px;
+            font-weight: 600;
+            padding: 2px 7px;
+            border-radius: 20px;
+            background: #1a2e1f;
+            color: #4ade80;
+            letter-spacing: 0.04em;
+        }
+
+        .card img {
+            flex: 1;
+            width: 100%;
+            min-height: 0;
+            object-fit: cover;
+            display: block;
+            background: #0d0f14;
+        }
+
+        /* ── Toast notification ── */
+        #toast {
+            position: fixed;
+            bottom: 18px;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            background: #1a1d2b;
+            border: 1px solid #2a2e45;
+            color: #e2e8f0;
+            font-size: 12px;
+            padding: 8px 18px;
+            border-radius: 20px;
+            opacity: 0;
+            transition: opacity 0.25s, transform 0.25s;
+            pointer-events: none;
+            white-space: nowrap;
+            z-index: 100;
+        }
+        #toast.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+        #toast.success { border-color: #4ade80; color: #4ade80; }
+        #toast.error   { border-color: #f87171; color: #f87171; }
     </style>
 </head>
 <body>
-    <h1>Multi-Camera Dashboard</h1>
 
-    <div class="small">D435: <code>{{ d435_base }}</code></div>
-    <div class="small">Pi Zero Left: <code>{{ pi_zero_cams["left"] }}</code></div>
-    <div class="small">Pi Zero Right: <code>{{ pi_zero_cams["right"] }}</code></div>
-    <div class="small">Pi Zero Bottom: <code>{{ pi_zero_cams["bottom"] }}</code></div>
-
-    <div class="card" style="margin: 16px 0;">
-        <h3 style="margin-top:0;">Capture Settings</h3>
-        <div class="field-row">
-            <label for="greenhouse_row">Greenhouse Row</label>
-            <input type="number" id="greenhouse_row" value="1" min="1" step="1" />
-            <label for="distance_from_start">Distance from Start (m)</label>
-            <input type="number" id="distance_from_start" value="0.0" min="0" step="0.1" />
-        </div>
+<div class="topbar">
+    <span class="logo">Greenhouse Guardians</span>
+    <div class="sep"></div>
+    <div class="field">
+        <label>Row</label>
+        <input type="number" id="greenhouse_row" value="1" min="1" step="1" />
     </div>
-
-    <div class="topbar">
-        <button class="btn" onclick="captureAll()">Capture All</button>
-        <button class="btn" onclick="checkHealth()">Health Check</button>
-        <div id="status" class="status">Ready.</div>
+    <div class="field">
+        <label>Distance (m)</label>
+        <input type="number" id="distance_from_start" value="0.0" min="0" step="0.1" />
     </div>
-
-    <div class="grid">
-        <div class="card">
-            <h3>D435 RGB</h3>
-            <img id="d435rgb" src="{{ d435_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
-        </div>
-        <div class="card">
-            <h3>D435 Depth</h3>
-            <img id="d435depth" src="{{ d435_base }}/stream/depth.mjpg?ts={{ now_ts }}" />
-        </div>
-        <div class="card">
-            <h3>Pi Zero Left</h3>
-            <img id="pi_left" src="{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
-        </div>
-        <div class="card">
-            <h3>Pi Zero Right</h3>
-            <img id="pi_right" src="{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
-        </div>
-        <div class="card">
-            <h3>Pi Zero Bottom</h3>
-            <img id="pi_bottom" src="{{ pi_zero_cams['bottom'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
-        </div>
+    <div class="sep"></div>
+    <button class="btn btn-capture" onclick="captureAll()">Capture All</button>
+    <button class="btn btn-health"  onclick="checkHealth()">Health</button>
+    <div class="status-wrap">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Ready</span>
     </div>
+</div>
 
-    <div class="card" style="margin-top:20px;">
-        <h3>Latest Health / Capture Result</h3>
-        <pre id="infoBox">No data yet.</pre>
+<div class="grid">
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">D435 &mdash; RGB</span>
+            <span class="pill" id="pill-d435rgb">LIVE</span>
+        </div>
+        <img id="d435rgb" src="{{ d435_base }}/stream/rgb.mjpg?ts={{ now_ts }}" />
     </div>
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">D435 &mdash; Depth</span>
+            <span class="pill" id="pill-d435depth">LIVE</span>
+        </div>
+        <img id="d435depth" src="{{ d435_base }}/stream/depth.mjpg?ts={{ now_ts }}" />
+    </div>
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Pi Zero &mdash; Left</span>
+            <span class="pill" id="pill-left">LIVE</span>
+        </div>
+        <img id="pi_left" src="{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+    </div>
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Pi Zero &mdash; Right</span>
+            <span class="pill" id="pill-right">LIVE</span>
+        </div>
+        <img id="pi_right" src="{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts={{ now_ts }}" />
+    </div>
+</div>
 
-    <script>
-        async function captureAll() {
-            const status = document.getElementById("status");
-            const greenhouse_row = parseInt(document.getElementById("greenhouse_row").value, 10);
-            const distanceFromRowStart = parseFloat(document.getElementById("distance_from_start").value);
+<div id="toast"></div>
 
-            if (isNaN(greenhouse_row) || isNaN(distanceFromRowStart)) {
-                status.textContent = "Please enter valid row and distance values.";
-                return;
-            }
+<script>
+    function setStatus(text, state) {
+        document.getElementById("statusText").textContent = text;
+        const dot = document.getElementById("statusDot");
+        dot.className = "status-dot" + (state ? " " + state : "");
+    }
 
-            status.textContent = "Capturing all cameras...";
-            try {
-                const res = await fetch("/capture_all", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ greenhouse_row, distanceFromRowStart }),
-                });
-                const data = await res.json();
-                if (data.ok) {
-                    status.textContent = "Saved: " + data.timestamp + " → " + data.save_dir;
-                } else {
-                    status.textContent = "Capture finished with some errors. Round: " + data.timestamp;
-                }
-                reloadStreams();
-                document.getElementById("infoBox").textContent = JSON.stringify(data, null, 2);
-            } catch (err) {
-                status.textContent = "Capture error: " + err;
-            }
+    function showToast(text, type) {
+        const t = document.getElementById("toast");
+        t.textContent = text;
+        t.className = "show " + (type || "");
+        clearTimeout(t._timer);
+        t._timer = setTimeout(() => { t.className = ""; }, 3500);
+    }
+
+    function setPill(id, online) {
+        const el = document.getElementById("pill-" + id);
+        if (!el) return;
+        el.textContent = online ? "LIVE" : "OFF";
+        el.style.background = online ? "#1a2e1f" : "#2e1a1a";
+        el.style.color       = online ? "#4ade80" : "#f87171";
+    }
+
+    async function captureAll() {
+        const greenhouse_row = parseInt(document.getElementById("greenhouse_row").value, 10);
+        const distanceFromRowStart = parseFloat(document.getElementById("distance_from_start").value);
+        if (isNaN(greenhouse_row) || isNaN(distanceFromRowStart)) {
+            showToast("Enter valid row and distance values.", "error");
+            return;
         }
-
-        async function checkHealth() {
-            const status = document.getElementById("status");
-            status.textContent = "Checking health...";
-            try {
-                const res = await fetch("/health_all");
-                const data = await res.json();
-                document.getElementById("infoBox").textContent = JSON.stringify(data, null, 2);
-                status.textContent = data.ok ? "Health OK." : "Some devices unavailable.";
-            } catch (err) {
-                status.textContent = "Health error: " + err;
+        setStatus("Capturing…", "busy");
+        try {
+            const res = await fetch("/capture_all", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ greenhouse_row, distanceFromRowStart }),
+            });
+            const data = await res.json();
+            if (data.ok) {
+                setStatus("Captured · Row " + greenhouse_row + " · " + distanceFromRowStart + " m", "");
+                showToast("Capture saved — " + data.timestamp, "success");
+            } else {
+                setStatus("Capture completed with errors", "error");
+                showToast("Some captures failed — check logs", "error");
             }
+            reloadStreams();
+        } catch (err) {
+            setStatus("Capture failed", "error");
+            showToast("Error: " + err, "error");
         }
+    }
 
-        function reloadStreams() {
-            const ts = Date.now();
-            document.getElementById("d435rgb").src = "{{ d435_base }}/stream/rgb.mjpg?ts=" + ts;
-            document.getElementById("d435depth").src = "{{ d435_base }}/stream/depth.mjpg?ts=" + ts;
-            document.getElementById("pi_left").src = "{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts=" + ts;
-            document.getElementById("pi_right").src = "{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts=" + ts;
-            document.getElementById("pi_bottom").src = "{{ pi_zero_cams['bottom'] }}/stream/rgb.mjpg?ts=" + ts;
+    async function checkHealth() {
+        setStatus("Checking health…", "busy");
+        try {
+            const res = await fetch("/health_all");
+            const data = await res.json();
+            setPill("d435rgb",  data.d435?.ok ?? false);
+            setPill("d435depth", data.d435?.ok ?? false);
+            setPill("left",  data.pi_zeros?.left?.ok  ?? false);
+            setPill("right", data.pi_zeros?.right?.ok ?? false);
+            if (data.ok) {
+                setStatus("All devices online", "");
+            } else {
+                const offline = [];
+                if (!data.d435?.ok) offline.push("D435");
+                if (!data.pi_zeros?.left?.ok)  offline.push("Left");
+                if (!data.pi_zeros?.right?.ok) offline.push("Right");
+                setStatus("Offline: " + offline.join(", "), "error");
+            }
+        } catch (err) {
+            setStatus("Health check failed", "error");
         }
+    }
 
-        window.addEventListener("load", () => {
-            checkHealth();
-            setInterval(checkHealth, 5000);
-        });
-    </script>
+    function reloadStreams() {
+        const ts = Date.now();
+        document.getElementById("d435rgb").src   = "{{ d435_base }}/stream/rgb.mjpg?ts="   + ts;
+        document.getElementById("d435depth").src = "{{ d435_base }}/stream/depth.mjpg?ts=" + ts;
+        document.getElementById("pi_left").src   = "{{ pi_zero_cams['left'] }}/stream/rgb.mjpg?ts="  + ts;
+        document.getElementById("pi_right").src  = "{{ pi_zero_cams['right'] }}/stream/rgb.mjpg?ts=" + ts;
+    }
+
+    window.addEventListener("load", () => {
+        checkHealth();
+        setInterval(checkHealth, 5000);
+    });
+</script>
 </body>
 </html>
 """
