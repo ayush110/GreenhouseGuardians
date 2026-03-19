@@ -39,6 +39,49 @@ def gst_rtp_pipeline(port: int) -> str:
     )
 
 
+class MjpegThread(QThread):
+    """Reads multipart/x-mixed-replace MJPEG streams via requests (more reliable than cv2.VideoCapture on macOS)."""
+    frame_ready = pyqtSignal(np.ndarray)
+    status_changed = pyqtSignal(bool)
+
+    def __init__(self, url, name="mjpeg"):
+        super().__init__()
+        self.url = url
+        self.name = name
+        self._running = True
+
+    def run(self):
+        while self._running:
+            try:
+                with requests.get(self.url, stream=True, timeout=5) as resp:
+                    resp.raise_for_status()
+                    self.status_changed.emit(True)
+                    buf = b""
+                    for chunk in resp.iter_content(chunk_size=4096):
+                        if not self._running:
+                            break
+                        buf += chunk
+                        while True:
+                            start = buf.find(b"\xff\xd8")
+                            end = buf.find(b"\xff\xd9", start + 2) if start != -1 else -1
+                            if start == -1 or end == -1:
+                                break
+                            jpg = buf[start:end + 2]
+                            buf = buf[end + 2:]
+                            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if frame is not None:
+                                self.frame_ready.emit(frame)
+            except Exception as e:
+                print(f"[{self.name}] error: {e}")
+            self.status_changed.emit(False)
+            if self._running:
+                time.sleep(3)
+
+    def stop(self):
+        self._running = False
+        self.wait()
+
+
 class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
     status_changed = pyqtSignal(bool)
@@ -254,15 +297,24 @@ class MainWindow(QMainWindow):
         root.addWidget(content)
 
     def _start_camera_threads(self):
-        cam_configs = [
-            (f"{D435_BASE}/stream/rgb.mjpg",   False, "d435_rgb",   self.card_d435_rgb),
-            (f"{D435_BASE}/stream/depth.mjpg", False, "d435_depth", self.card_d435_depth),
-            (gst_rtp_pipeline(5001),           True,  "left",       self.card_left),
-            (gst_rtp_pipeline(5002),           True,  "right",      self.card_right),
-            (gst_rtp_pipeline(5003),           True,  "bottom",     self.card_bottom),
-        ]
-        for source, is_gst, name, card in cam_configs:
-            t = CameraThread(source, is_gstreamer=is_gst, name=name)
+        # D435 streams: use MjpegThread (cv2.VideoCapture can't handle multipart MJPEG on macOS)
+        for url, name, card in [
+            (f"{D435_BASE}/stream/rgb.mjpg",   "d435_rgb",   self.card_d435_rgb),
+            (f"{D435_BASE}/stream/depth.mjpg", "d435_depth", self.card_d435_depth),
+        ]:
+            t = MjpegThread(url, name=name)
+            t.frame_ready.connect(card.set_frame)
+            t.status_changed.connect(card.set_status)
+            t.start()
+            self._threads.append(t)
+
+        # Pi Zero streams: MJPEG over HTTP
+        for url, name, card in [
+            (f"{PI_ZERO_CAMS['left'][0]}/stream/rgb.mjpg",   "left",   self.card_left),
+            (f"{PI_ZERO_CAMS['right'][0]}/stream/rgb.mjpg",  "right",  self.card_right),
+            (f"{PI_ZERO_CAMS['bottom'][0]}/stream/rgb.mjpg", "bottom", self.card_bottom),
+        ]:
+            t = MjpegThread(url, name=name)
             t.frame_ready.connect(card.set_frame)
             t.status_changed.connect(card.set_status)
             t.start()

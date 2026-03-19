@@ -18,6 +18,9 @@ STREAM_PORT = int(os.environ.get("STREAM_PORT", "5001"))
 STREAM_WIDTH = 640
 STREAM_HEIGHT = 360
 
+PREVIEW_WIDTH = 320
+PREVIEW_HEIGHT = 180
+
 STILL_WIDTH = 4608
 STILL_HEIGHT = 2592
 
@@ -27,6 +30,9 @@ picam2 = Picamera2()
 camera_lock = threading.Lock()
 gst_proc = None
 stream_running = False
+
+_preview_jpg = b""
+_preview_lock = threading.Lock()
 
 
 def timestamp_now():
@@ -50,6 +56,7 @@ def wait_until_trigger(trigger_at_ms):
 def configure_stream():
     config = picam2.create_video_configuration(
         main={"size": (STREAM_WIDTH, STREAM_HEIGHT), "format": "YUV420"},
+        lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"},
         buffer_count=2
     )
     picam2.configure(config)
@@ -96,9 +103,30 @@ def stop_gst_stream():
         gst_proc = None
 
 
+def _preview_worker():
+    global _preview_jpg
+    from PIL import Image
+    while True:
+        if not stream_running:
+            time.sleep(0.1)
+            continue
+        try:
+            with picam2.capture_request() as req:
+                frame = req.make_array("lores")  # RGB888
+            img = Image.fromarray(frame)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            with _preview_lock:
+                _preview_jpg = buf.getvalue()
+        except Exception:
+            time.sleep(0.1)
+        time.sleep(0.05)  # ~15 fps
+
+
 def init_camera():
     configure_stream()
     start_gst_stream()
+    threading.Thread(target=_preview_worker, daemon=True).start()
     time.sleep(2)
 
 
@@ -115,6 +143,26 @@ def health():
         "still_width": STILL_WIDTH,
         "still_height": STILL_HEIGHT,
     })
+
+
+@app.route("/stream/rgb.mjpg")
+def stream_rgb():
+    def generate():
+        last = b""
+        while True:
+            with _preview_lock:
+                jpg = _preview_jpg
+            if jpg and jpg is not last:
+                last = jpg
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
+                    + jpg + b"\r\n"
+                )
+            else:
+                time.sleep(0.05)
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/capture", methods=["POST"])
