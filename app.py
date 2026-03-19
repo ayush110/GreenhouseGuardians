@@ -12,7 +12,7 @@ import subprocess
 app = Flask(__name__)
 
 CAM_NAME = os.environ.get("CAM_NAME", "pi_zero_unknown")
-DASHBOARD_IP = os.environ.get("DASHBOARD_IP", "172.20.10.1")
+DASHBOARD_IP = os.environ.get("DASHBOARD_IP", "172.20.10.6")
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "5001"))
 
 STREAM_WIDTH = 640
