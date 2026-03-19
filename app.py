@@ -1,44 +1,32 @@
 from flask import Flask, Response, jsonify, request
 from picamera2 import Picamera2
-from picamera2.encoders import MJPEGEncoder
+from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
 import threading
 import time
 from datetime import datetime
 import io
 import os
+import subprocess
 
 app = Flask(__name__)
 
 CAM_NAME = os.environ.get("CAM_NAME", "pi_zero_unknown")
+DASHBOARD_IP = os.environ.get("DASHBOARD_IP", "172.20.10.1")
+STREAM_PORT = int(os.environ.get("STREAM_PORT", "5001"))
 
-PREVIEW_WIDTH = 960
-PREVIEW_HEIGHT = 540
+STREAM_WIDTH = 640
+STREAM_HEIGHT = 360
 
 STILL_WIDTH = 4608
 STILL_HEIGHT = 2592
 
 JPEG_QUALITY_CAPTURE = 95
 
-
-class StreamingOutput(io.BufferedIOBase):
-    def __init__(self):
-        self.frame = None
-        self.condition = threading.Condition()
-        self.timestamp = ""
-        self.frame_counter = 0
-
-    def write(self, buf):
-        with self.condition:
-            self.frame = buf
-            self.timestamp = timestamp_now()
-            self.frame_counter += 1
-            self.condition.notify_all()
-
-
-app_output = StreamingOutput()
 picam2 = Picamera2()
 camera_lock = threading.Lock()
+gst_proc = None
+stream_running = False
 
 
 def timestamp_now():
@@ -59,20 +47,35 @@ def wait_until_trigger(trigger_at_ms):
             time.sleep(0.001)
 
 
-def configure_preview():
+def configure_stream():
     config = picam2.create_video_configuration(
-        main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"},
-        buffer_count=3
+        main={"size": (STREAM_WIDTH, STREAM_HEIGHT), "format": "YUV420"},
+        buffer_count=2
     )
     picam2.configure(config)
 
 
-def start_preview_stream():
-    encoder = MJPEGEncoder()
-    picam2.start_recording(encoder, FileOutput(app_output))
+def start_gst_stream():
+    global gst_proc, stream_running
+    gst_proc = subprocess.Popen(
+        [
+            "gst-launch-1.0", "fdsrc", "!",
+            "h264parse", "!",
+            "rtph264pay", "config-interval=1", "pt=96", "!",
+            "udpsink", f"host={DASHBOARD_IP}", f"port={STREAM_PORT}",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    encoder = H264Encoder(bitrate=2_000_000)
+    picam2.start_recording(encoder, FileOutput(gst_proc.stdin))
+    stream_running = True
 
 
-def stop_preview_stream():
+def stop_gst_stream():
+    global gst_proc, stream_running
+    stream_running = False
     try:
         picam2.stop_recording()
     except Exception:
@@ -80,35 +83,23 @@ def stop_preview_stream():
             picam2.stop()
         except Exception:
             pass
+    if gst_proc is not None:
+        try:
+            gst_proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            gst_proc.terminate()
+            gst_proc.wait(timeout=3)
+        except Exception:
+            pass
+        gst_proc = None
 
 
 def init_camera():
-    configure_preview()
-    start_preview_stream()
+    configure_stream()
+    start_gst_stream()
     time.sleep(2)
-
-
-def mjpeg_generator():
-    while True:
-        try:
-            with app_output.condition:
-                app_output.condition.wait()
-                frame = app_output.frame
-            if frame is None:
-                continue
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n\r\n"
-                + frame +
-                b"\r\n"
-            )
-        except GeneratorExit:
-            break
-        except Exception as e:
-            print(f"Stream generator error: {e}")
-            time.sleep(0.05)
 
 
 @app.route("/health")
@@ -116,31 +107,14 @@ def health():
     return jsonify({
         "ok": True,
         "camera_name": CAM_NAME,
-        "frames_ready": app_output.frame is not None,
-        "frame_counter": app_output.frame_counter,
-        "preview_width": PREVIEW_WIDTH,
-        "preview_height": PREVIEW_HEIGHT,
+        "stream_running": stream_running,
+        "stream_host": DASHBOARD_IP,
+        "stream_port": STREAM_PORT,
+        "stream_width": STREAM_WIDTH,
+        "stream_height": STREAM_HEIGHT,
         "still_width": STILL_WIDTH,
         "still_height": STILL_HEIGHT,
-        "latest_timestamp": app_output.timestamp
     })
-
-
-@app.route("/stream/rgb.mjpg")
-def stream_rgb():
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "X-Accel-Buffering": "no",
-        "Connection": "close",
-    }
-    return Response(
-        mjpeg_generator(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-        headers=headers,
-        direct_passthrough=True
-    )
 
 
 @app.route("/capture", methods=["POST"])
@@ -152,7 +126,7 @@ def capture():
         trigger_at_ms = body.get("trigger_at_ms")
 
         with camera_lock:
-            stop_preview_stream()
+            stop_gst_stream()
 
             still_config = picam2.create_still_configuration(
                 main={"size": (STILL_WIDTH, STILL_HEIGHT), "format": "RGB888"}
@@ -169,8 +143,8 @@ def capture():
             captured_ts = timestamp_now()
 
             picam2.stop()
-            configure_preview()
-            start_preview_stream()
+            configure_stream()
+            start_gst_stream()
             time.sleep(0.2)
 
         from PIL import Image
@@ -184,7 +158,6 @@ def capture():
         resp = Response(jpg, mimetype="image/jpeg")
         resp.headers["X-Timestamp"] = captured_ts
         resp.headers["X-Requested-Timestamp"] = ts_requested
-        resp.headers["X-Frame-Counter"] = str(app_output.frame_counter)
         resp.headers["X-Camera-Name"] = CAM_NAME
         resp.headers["X-Width"] = str(frame.shape[1])
         resp.headers["X-Height"] = str(frame.shape[0])
