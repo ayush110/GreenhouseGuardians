@@ -1,0 +1,8 @@
+{
+  "timestamp": "20260318_150720_484",
+  "frame_counter": 68279,
+  "camera_name": "pi_zero_right",
+  "width": 4608,
+  "height": 2592,
+  "base_url": "http://172.20.10.4:8001"
+}

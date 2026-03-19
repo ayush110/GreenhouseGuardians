@@ -15,6 +15,9 @@
 #include <thread>
 #include <vector>
 
+#include <thread>
+#include <ctime>
+
 namespace fs = std::filesystem;
 
 struct SharedFrames {
@@ -35,6 +38,28 @@ static float g_depth_scale = 0.0f;
 static rs2_intrinsics g_color_intrinsics{};
 static bool g_intrinsics_ready = false;
 static std::atomic<bool> g_camera_connected{false};
+
+uint64_t now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
+}
+
+void wait_until_trigger_ms(uint64_t trigger_at_ms) {
+    while (true) {
+        uint64_t current = now_ms();
+        if (current >= trigger_at_ms) return;
+
+        uint64_t remaining = trigger_at_ms - current;
+        if (remaining > 20) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(remaining - 10));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
 
 std::string timestamp_now() {
     auto now = std::chrono::system_clock::now();
@@ -287,58 +312,69 @@ int main(int argc, char** argv) {
         mjpeg_stream_handler(res, false);
     });
 
-    svr.Post("/capture", [](const httplib::Request&, httplib::Response& res) {
-        cv::Mat rgb, depth_raw, depth_color;
-        std::string ts;
-        uint64_t counter = 0;
-
-        if (!get_latest_frames(rgb, depth_raw, depth_color, ts, counter)) {
-            res.status = 503;
-            res.set_content("{\"ok\":false,\"error\":\"frames not ready\"}", "application/json");
-            return;
+    svr.Post("/capture", [](const httplib::Request& req, httplib::Response& res) {
+    try {
+        if (!req.body.empty()) {
+            auto body = nlohmann::json::parse(req.body);
+            if (body.contains("trigger_at_ms") && body["trigger_at_ms"].is_number_unsigned()) {
+                uint64_t trigger_at_ms = body["trigger_at_ms"].get<uint64_t>();
+                wait_until_trigger_ms(trigger_at_ms);
+            }
         }
+    } catch (...) {
+        // ignore bad JSON and continue immediate capture
+    }
 
-        float depth_scale = 0.0f;
-        rs2_intrinsics intr{};
-        bool intr_ok = false;
+    cv::Mat rgb, depth_raw, depth_color;
+    std::string ts;
+    uint64_t counter = 0;
 
-        {
-            std::lock_guard<std::mutex> lock(g_meta_mutex);
-            depth_scale = g_depth_scale;
-            intr = g_color_intrinsics;
-            intr_ok = g_intrinsics_ready;
-        }
+    if (!get_latest_frames(rgb, depth_raw, depth_color, ts, counter)) {
+        res.status = 503;
+        res.set_content("{\"ok\":false,\"error\":\"frames not ready\"}", "application/json");
+        return;
+    }
 
-        if (!intr_ok) {
-            res.status = 503;
-            res.set_content("{\"ok\":false,\"error\":\"intrinsics not ready\"}", "application/json");
-            return;
-        }
+    float depth_scale = 0.0f;
+    rs2_intrinsics intr{};
+    bool intr_ok = false;
 
-        std::vector<uchar> rgb_jpg = encode_jpeg(rgb, 95);
-        std::vector<uchar> depth_png;
-        cv::imencode(".png", depth_raw, depth_png);
+    {
+        std::lock_guard<std::mutex> lock(g_meta_mutex);
+        depth_scale = g_depth_scale;
+        intr = g_color_intrinsics;
+        intr_ok = g_intrinsics_ready;
+    }
 
-        res.set_header("X-Timestamp", ts);
-        res.set_header("X-Frame-Counter", std::to_string(counter));
-        res.set_header("X-RGB-Size", std::to_string(rgb_jpg.size()));
-        res.set_header("X-Depth-Scale", std::to_string(depth_scale));
-        res.set_header("X-FX", std::to_string(intr.fx));
-        res.set_header("X-FY", std::to_string(intr.fy));
-        res.set_header("X-CX", std::to_string(intr.ppx));
-        res.set_header("X-CY", std::to_string(intr.ppy));
-        res.set_header("X-Width", std::to_string(rgb.cols));
-        res.set_header("X-Height", std::to_string(rgb.rows));
-        res.set_header("Content-Type", "application/octet-stream");
+    if (!intr_ok) {
+        res.status = 503;
+        res.set_content("{\"ok\":false,\"error\":\"intrinsics not ready\"}", "application/json");
+        return;
+    }
 
-        std::string body;
-        body.reserve(rgb_jpg.size() + depth_png.size());
+    std::vector<uchar> rgb_jpg = encode_jpeg(rgb, 95);
+    std::vector<uchar> depth_png;
+    cv::imencode(".png", depth_raw, depth_png);
 
-        body.append(reinterpret_cast<const char*>(rgb_jpg.data()), rgb_jpg.size());
-        body.append(reinterpret_cast<const char*>(depth_png.data()), depth_png.size());
+    res.set_header("X-Timestamp", ts);
+    res.set_header("X-Frame-Counter", std::to_string(counter));
+    res.set_header("X-RGB-Size", std::to_string(rgb_jpg.size()));
+    res.set_header("X-Depth-Scale", std::to_string(depth_scale));
+    res.set_header("X-FX", std::to_string(intr.fx));
+    res.set_header("X-FY", std::to_string(intr.fy));
+    res.set_header("X-CX", std::to_string(intr.ppx));
+    res.set_header("X-CY", std::to_string(intr.ppy));
+    res.set_header("X-Width", std::to_string(rgb.cols));
+    res.set_header("X-Height", std::to_string(rgb.rows));
+    res.set_header("Content-Type", "application/octet-stream");
 
-        res.body = std::move(body);
-    });
+    std::string body;
+    body.reserve(rgb_jpg.size() + depth_png.size());
+    body.append(reinterpret_cast<const char*>(rgb_jpg.data()), rgb_jpg.size());
+    body.append(reinterpret_cast<const char*>(depth_png.data()), depth_png.size());
+
+    res.body = std::move(body);
+});
 
     std::cout << "Server listening on http://" << host << ":" << port << std::endl;
     std::cout << "RGB stream:   /stream/rgb.mjpg" << std::endl;

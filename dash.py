@@ -5,19 +5,25 @@ from datetime import datetime
 import json
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 
 app = Flask(__name__)
 
 D435_BASE = "http://172.20.10.2:8000"
 
 PI_ZERO_CAMS = {
+    "left": "http://172.20.10.7:8001",
     "right": "http://172.20.10.4:8001",
     "bottom": "http://172.20.10.5:8001",
-    "left": "http://172.20.10.7:8001",
 }
 
-SAVE_DIR = Path("captures")
-SAVE_DIR.mkdir(exist_ok=True)
+SAVE_DIR = Path.home() / "multi_camera_captures"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+HTTP = requests.Session()
+HTTP.mount("http://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 
 HTML = """
 <!doctype html>
@@ -144,12 +150,12 @@ HTML = """
                 const res = await fetch("/capture_all", { method: "POST" });
                 const data = await res.json();
                 if (data.ok) {
-                    status.textContent = "Saved round: " + data.timestamp;
-                    reloadStreams();
+                    status.textContent = "Saved round: " + data.timestamp + " to " + data.save_dir;
                 } else {
-                    status.textContent = "Capture finished with errors. Saved round: " + data.timestamp;
-                    reloadStreams();
+                    status.textContent = "Capture finished with some errors. Round: " + data.timestamp;
                 }
+                reloadStreams();
+                document.getElementById("healthBox").textContent = JSON.stringify(data, null, 2);
             } catch (err) {
                 status.textContent = "Capture error: " + err;
             }
@@ -206,18 +212,16 @@ def health_all():
         "pi_zeros": {}
     }
 
-    # D435 health
     try:
-        r = requests.get(f"{D435_BASE}/health", timeout=3)
+        r = HTTP.get(f"{D435_BASE}/health", timeout=3)
         out["d435"] = r.json()
     except Exception as e:
         out["ok"] = False
         out["d435"] = {"ok": False, "error": str(e)}
 
-    # Pi Zero health
     for cam_name, base_url in PI_ZERO_CAMS.items():
         try:
-            r = requests.get(f"{base_url}/health", timeout=3)
+            r = HTTP.get(f"{base_url}/health", timeout=3)
             out["pi_zeros"][cam_name] = r.json()
         except Exception as e:
             out["ok"] = False
@@ -226,130 +230,157 @@ def health_all():
     return jsonify(out)
 
 
+def capture_d435(round_dir: Path, trigger_at_ms: int):
+    r = HTTP.post(
+        f"{D435_BASE}/capture",
+        json={"trigger_at_ms": trigger_at_ms},
+        timeout=25
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"D435 capture failed with status {r.status_code}: {r.text}")
+
+    rgb_size = int(r.headers.get("X-RGB-Size", "0"))
+    frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
+    depth_scale = float(r.headers.get("X-Depth-Scale", "0"))
+    fx = float(r.headers.get("X-FX", "0"))
+    fy = float(r.headers.get("X-FY", "0"))
+    cx = float(r.headers.get("X-CX", "0"))
+    cy = float(r.headers.get("X-CY", "0"))
+    width = int(r.headers.get("X-Width", "0"))
+    height = int(r.headers.get("X-Height", "0"))
+    d435_ts = r.headers.get("X-Timestamp", "")
+
+    payload = r.content
+    if rgb_size <= 0 or rgb_size >= len(payload):
+        raise RuntimeError("Invalid D435 payload sizes")
+
+    rgb_bytes = payload[:rgb_size]
+    depth_png_bytes = payload[rgb_size:]
+
+    d435_dir = round_dir / "d435"
+    d435_dir.mkdir(exist_ok=True)
+
+    rgb_path = d435_dir / "d435_rgb.jpg"
+    depth_path = d435_dir / "d435_depth_raw.png"
+    npy_path = d435_dir / "d435_depth_raw.npy"
+    meta_path = d435_dir / "d435_meta.json"
+
+    rgb_path.write_bytes(rgb_bytes)
+    depth_path.write_bytes(depth_png_bytes)
+
+    depth_img = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    np.save(npy_path, depth_img)
+
+    meta = {
+        "camera_name": "d435",
+        "timestamp": d435_ts,
+        "frame_counter": frame_counter,
+        "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
+        "depth_dtype": str(depth_img.dtype) if depth_img is not None else None,
+        "depth_shape": list(depth_img.shape) if depth_img is not None else None,
+        "depth_scale_m_per_unit": depth_scale,
+        "intrinsics": {
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "width": width,
+            "height": height
+        }
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    return {
+        "rgb_path": str(rgb_path),
+        "depth_path": str(depth_path),
+        "npy_path": str(npy_path),
+        "meta_path": str(meta_path),
+        "timestamp": d435_ts,
+    }
+
+
+def capture_pi_zero(cam_name: str, base_url: str, round_dir: Path, trigger_at_ms: int):
+    r = HTTP.post(
+        f"{base_url}/capture",
+        json={"trigger_at_ms": trigger_at_ms},
+        timeout=25
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"{cam_name} capture failed with status {r.status_code}: {r.text}")
+
+    pi_ts = r.headers.get("X-Timestamp", "")
+    frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
+    returned_cam_name = r.headers.get("X-Camera-Name", cam_name)
+    width = int(r.headers.get("X-Width", "0"))
+    height = int(r.headers.get("X-Height", "0"))
+
+    pi_dir = round_dir / cam_name
+    pi_dir.mkdir(exist_ok=True)
+
+    img_path = pi_dir / f"{returned_cam_name}_rgb.jpg"
+    meta_path = pi_dir / f"{returned_cam_name}_meta.json"
+
+    img_path.write_bytes(r.content)
+
+    meta = {
+        "camera_name": returned_cam_name,
+        "timestamp": pi_ts,
+        "frame_counter": frame_counter,
+        "width": width,
+        "height": height,
+        "base_url": base_url,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    return {
+        "rgb_path": str(img_path),
+        "meta_path": str(meta_path),
+        "timestamp": pi_ts,
+        "camera_name": returned_cam_name,
+    }
+
+
 @app.route("/capture_all", methods=["POST"])
 def capture_all():
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    round_dir = SAVE_DIR / timestamp
+    round_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    round_dir = SAVE_DIR / round_timestamp
     round_dir.mkdir(parents=True, exist_ok=True)
+
+    # one shared future time for all devices
+    trigger_at_ms = (time.time_ns() // 1_000_000) + 1500
 
     result = {
         "ok": True,
-        "timestamp": timestamp,
-        "saved": {}
+        "timestamp": round_timestamp,
+        "trigger_at_ms": trigger_at_ms,
+        "save_dir": str(round_dir),
+        "saved": {
+            "d435": None,
+            "pi_zeros": {}
+        }
     }
 
-    # -----------------------------
-    # Capture D435 (UNCHANGED)
-    # -----------------------------
-    try:
-        r = requests.post(f"{D435_BASE}/capture", timeout=20)
-        if r.status_code != 200:
-            raise RuntimeError(f"D435 capture failed with status {r.status_code}")
+    futures = {}
+    with ThreadPoolExecutor(max_workers=1 + len(PI_ZERO_CAMS)) as executor:
+        futures[executor.submit(capture_d435, round_dir, trigger_at_ms)] = ("d435", "d435")
 
-        rgb_size = int(r.headers.get("X-RGB-Size", "0"))
-        frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
-        depth_scale = float(r.headers.get("X-Depth-Scale", "0"))
-        fx = float(r.headers.get("X-FX", "0"))
-        fy = float(r.headers.get("X-FY", "0"))
-        cx = float(r.headers.get("X-CX", "0"))
-        cy = float(r.headers.get("X-CY", "0"))
-        width = int(r.headers.get("X-Width", "0"))
-        height = int(r.headers.get("X-Height", "0"))
-        d435_ts = r.headers.get("X-Timestamp", timestamp)
+        for cam_name, base_url in PI_ZERO_CAMS.items():
+            futures[executor.submit(capture_pi_zero, cam_name, base_url, round_dir, trigger_at_ms)] = ("pi_zero", cam_name)
 
-        payload = r.content
-        if rgb_size <= 0 or rgb_size >= len(payload):
-            raise RuntimeError("Invalid D435 payload sizes")
+        for future in as_completed(futures):
+            kind, name = futures[future]
+            try:
+                saved_info = future.result()
+                if kind == "d435":
+                    result["saved"]["d435"] = saved_info
+                else:
+                    result["saved"]["pi_zeros"][name] = saved_info
+            except Exception as e:
+                result["ok"] = False
+                result[f"{name}_error"] = str(e)
 
-        rgb_bytes = payload[:rgb_size]
-        depth_png_bytes = payload[rgb_size:]
-
-        d435_dir = round_dir / "d435"
-        d435_dir.mkdir(exist_ok=True)
-
-        rgb_path = d435_dir / "rgb.jpg"
-        depth_path = d435_dir / "depth_raw.png"
-        npy_path = d435_dir / "depth_raw.npy"
-        meta_path = d435_dir / "meta.json"
-
-        rgb_path.write_bytes(rgb_bytes)
-        depth_path.write_bytes(depth_png_bytes)
-
-        depth_img = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-        np.save(npy_path, depth_img)
-
-        meta = {
-            "timestamp": d435_ts,
-            "frame_counter": frame_counter,
-            "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
-            "depth_dtype": str(depth_img.dtype) if depth_img is not None else None,
-            "depth_shape": list(depth_img.shape) if depth_img is not None else None,
-            "depth_scale_m_per_unit": depth_scale,
-            "intrinsics": {
-                "fx": fx,
-                "fy": fy,
-                "cx": cx,
-                "cy": cy,
-                "width": width,
-                "height": height
-            }
-        }
-        meta_path.write_text(json.dumps(meta, indent=2))
-
-        result["saved"]["d435"] = {
-            "rgb_path": str(rgb_path),
-            "depth_path": str(depth_path),
-            "npy_path": str(npy_path),
-            "meta_path": str(meta_path),
-        }
-
-    except Exception as e:
-        result["ok"] = False
-        result["d435_error"] = str(e)
-
-    # -----------------------------
-    # Capture all Pi Zeros
-    # -----------------------------
-    result["saved"]["pi_zeros"] = {}
-
-    for cam_name, base_url in PI_ZERO_CAMS.items():
-        try:
-            r = requests.post(f"{base_url}/capture", timeout=15)
-            if r.status_code != 200:
-                raise RuntimeError(f"{cam_name} capture failed with status {r.status_code}")
-
-            pi_ts = r.headers.get("X-Timestamp", timestamp)
-            frame_counter = int(r.headers.get("X-Frame-Counter", "0"))
-            returned_cam_name = r.headers.get("X-Camera-Name", cam_name)
-            width = int(r.headers.get("X-Width", "0"))
-            height = int(r.headers.get("X-Height", "0"))
-
-            pi_dir = round_dir / cam_name
-            pi_dir.mkdir(exist_ok=True)
-
-            img_path = pi_dir / "rgb.jpg"
-            meta_path = pi_dir / "meta.json"
-
-            img_path.write_bytes(r.content)
-
-            meta = {
-                "timestamp": pi_ts,
-                "frame_counter": frame_counter,
-                "camera_name": returned_cam_name,
-                "width": width,
-                "height": height,
-                "base_url": base_url
-            }
-            meta_path.write_text(json.dumps(meta, indent=2))
-
-            result["saved"]["pi_zeros"][cam_name] = {
-                "rgb_path": str(img_path),
-                "meta_path": str(meta_path),
-            }
-
-        except Exception as e:
-            result["ok"] = False
-            result[f"{cam_name}_error"] = str(e)
+    summary_path = round_dir / "capture_summary.json"
+    summary_path.write_text(json.dumps(result, indent=2))
 
     return jsonify(result)
 
