@@ -17,13 +17,13 @@ PI_ZERO_CAMS = {
     "right": "http://172.20.10.4:8001",
 }
 
-API_BASE = "https://kayenm-greenhouseguardians.hf.space/api/upload"
+API_BASE = "https://greenhouseguardiansorg-greenhouseguardians.hf.space/api/upload"
 
 SAVE_DIR = Path.home() / "multi_camera_captures"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 HTTP = requests.Session()
-HTTP.mount("http://",  requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
+HTTP.mount("http://",  requests.adapters.HTTPAdapter(pool_connections=d10, pool_maxsize=10))
 HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 
 HTML = """
@@ -198,7 +198,7 @@ HTML = """
             flex: 1;
             width: 100%;
             min-height: 0;
-            object-fit: cover;
+            object-fit: contain;
             display: block;
             background: #0d0f14;
         }
