@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
             }
         }
     } catch (...) {
-        // ignore bad JSON and continue immediate capture
+        // Ignore malformed JSON and continue with immediate capture
     }
 
     cv::Mat rgb, depth_raw, depth_color;
@@ -354,13 +354,26 @@ int main(int argc, char** argv) {
         return;
     }
 
-    std::vector<uchar> rgb_jpg = encode_jpeg(rgb, 95);
-    std::vector<uchar> depth_png;
-    cv::imencode(".png", depth_raw, depth_png);
+    if (depth_raw.empty() || depth_raw.type() != CV_16UC1) {
+        res.status = 500;
+        res.set_content("{\"ok\":false,\"error\":\"invalid depth frame\"}", "application/json");
+        return;
+    }
+
+    // Lower quality than 95 for faster encoding with minimal visible loss
+    std::vector<uchar> rgb_jpg = encode_jpeg(rgb, 80);
+
+    const size_t depth_raw_size = depth_raw.total() * depth_raw.elemSize();
+
+    std::string body;
+    body.reserve(rgb_jpg.size() + depth_raw_size);
+    body.append(reinterpret_cast<const char*>(rgb_jpg.data()), rgb_jpg.size());
+    body.append(reinterpret_cast<const char*>(depth_raw.data), depth_raw_size);
 
     res.set_header("X-Timestamp", ts);
     res.set_header("X-Frame-Counter", std::to_string(counter));
     res.set_header("X-RGB-Size", std::to_string(rgb_jpg.size()));
+    res.set_header("X-Depth-Raw-Size", std::to_string(depth_raw_size));
     res.set_header("X-Depth-Scale", std::to_string(depth_scale));
     res.set_header("X-FX", std::to_string(intr.fx));
     res.set_header("X-FY", std::to_string(intr.fy));
@@ -369,11 +382,6 @@ int main(int argc, char** argv) {
     res.set_header("X-Width", std::to_string(rgb.cols));
     res.set_header("X-Height", std::to_string(rgb.rows));
     res.set_header("Content-Type", "application/octet-stream");
-
-    std::string body;
-    body.reserve(rgb_jpg.size() + depth_png.size());
-    body.append(reinterpret_cast<const char*>(rgb_jpg.data()), rgb_jpg.size());
-    body.append(reinterpret_cast<const char*>(depth_png.data()), depth_png.size());
 
     res.body = std::move(body);
 });

@@ -7,13 +7,14 @@ import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import io
 
 app = Flask(__name__)
 
-D435_BASE = "http://172.20.10.2:8000"
+D435_BASE = "http://172.20.10.3:8000"
 
 PI_ZERO_CAMS = {
-    "left":  "http://172.20.10.7:8001",
+    "left":  "http://172.20.10.5:8001",
     "right": "http://172.20.10.4:8001",
 }
 
@@ -23,7 +24,7 @@ SAVE_DIR = Path.home() / "multi_camera_captures"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 HTTP = requests.Session()
-HTTP.mount("http://",  requests.adapters.HTTPAdapter(pool_connections=d10, pool_maxsize=10))
+HTTP.mount("http://",  requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 
 HTML = """
@@ -409,16 +410,16 @@ def health_all():
     return jsonify(out)
 
 
-def capture_d435(round_dir: Path, trigger_at_ms: int):
+def capture_d435(round_dir: Path):
     r = HTTP.post(
         f"{D435_BASE}/capture",
-        json={"trigger_at_ms": trigger_at_ms},
         timeout=25,
     )
     if r.status_code != 200:
         raise RuntimeError(f"D435 capture failed with status {r.status_code}: {r.text}")
 
     rgb_size = int(r.headers.get("X-RGB-Size", "0"))
+    depth_raw_size = int(r.headers.get("X-Depth-Raw-Size", "0"))
     depth_scale = float(r.headers.get("X-Depth-Scale", "0"))
     fx = float(r.headers.get("X-FX", "0"))
     fy = float(r.headers.get("X-FY", "0"))
@@ -429,45 +430,77 @@ def capture_d435(round_dir: Path, trigger_at_ms: int):
     d435_ts = r.headers.get("X-Timestamp", "")
 
     payload = r.content
-    if rgb_size <= 0 or rgb_size >= len(payload):
-        raise RuntimeError("Invalid D435 payload sizes")
+    expected_size = rgb_size + depth_raw_size
+
+    if rgb_size <= 0 or depth_raw_size <= 0:
+        raise RuntimeError(
+            f"Invalid D435 payload sizes: rgb_size={rgb_size}, depth_raw_size={depth_raw_size}"
+        )
+
+    if len(payload) != expected_size:
+        raise RuntimeError(
+            f"Unexpected D435 payload length: got {len(payload)}, expected {expected_size}"
+        )
 
     rgb_bytes = payload[:rgb_size]
-    depth_png_bytes = payload[rgb_size:]
+    depth_raw_bytes = payload[rgb_size:rgb_size + depth_raw_size]
+
+    expected_depth_bytes = width * height * 2  # uint16 depth
+    if depth_raw_size != expected_depth_bytes:
+        raise RuntimeError(
+            f"Depth byte size mismatch: got {depth_raw_size}, expected {expected_depth_bytes}"
+        )
+
+    depth_img = np.frombuffer(depth_raw_bytes, dtype=np.uint16).reshape((height, width))
+
+    npy_buffer = io.BytesIO()
+    np.save(npy_buffer, depth_img)
+    npy_bytes = npy_buffer.getvalue()
 
     d435_dir = round_dir / "d435"
     d435_dir.mkdir(exist_ok=True)
 
     rgb_path = d435_dir / "d435_rgb.jpg"
-    depth_path = d435_dir / "d435_depth_raw.png"
+    raw_depth_path = d435_dir / "d435_depth_raw.bin"
     npy_path = d435_dir / "d435_depth_raw.npy"
     meta_path = d435_dir / "d435_meta.json"
 
+    # Optional local archive/debug copies
     rgb_path.write_bytes(rgb_bytes)
-    depth_path.write_bytes(depth_png_bytes)
-
-    depth_img = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-    np.save(npy_path, depth_img)
+    raw_depth_path.write_bytes(depth_raw_bytes)
+    npy_path.write_bytes(npy_bytes)
 
     meta = {
         "camera_name": "d435",
         "timestamp": d435_ts,
-        "depth_format": "RS2_FORMAT_Z16 stored as 16-bit PNG",
-        "depth_dtype": str(depth_img.dtype) if depth_img is not None else None,
-        "depth_shape": list(depth_img.shape) if depth_img is not None else None,
+        "depth_format": "RS2_FORMAT_Z16 raw uint16 bytes",
+        "depth_dtype": str(depth_img.dtype),
+        "depth_shape": list(depth_img.shape),
         "depth_scale_m_per_unit": depth_scale,
-        "intrinsics": {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": width, "height": height},
+        "intrinsics": {
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "width": width,
+            "height": height,
+        },
     }
     meta_path.write_text(json.dumps(meta, indent=2))
 
     return {
         "rgb_path": str(rgb_path),
-        "depth_path": str(depth_path),
+        "depth_path": str(raw_depth_path),   # kept for compatibility with summary/debug
         "npy_path": str(npy_path),
         "meta_path": str(meta_path),
         "timestamp": d435_ts,
+        # extra in-memory values if you want to upload without rereading files later
+        "rgb_bytes": rgb_bytes,
+        "npy_bytes": npy_bytes,
+        "depth_raw_bytes": depth_raw_bytes,
+        "intrinsics": meta["intrinsics"],
+        "depth_scale_m_per_unit": depth_scale,
     }
-
 
 def capture_pi_zero(cam_name: str, base_url: str, round_dir: Path, trigger_at_ms: int):
     r = HTTP.post(
@@ -541,23 +574,38 @@ def upload_d435_data(saved: dict, greenhouse_row: int, distance: float, timestam
     if not d435_info:
         raise RuntimeError("No D435 capture data available to upload")
 
-    meta = json.loads(Path(d435_info["meta_path"]).read_text())
-    rgb_path = Path(d435_info["rgb_path"])
-    npy_path = Path(d435_info["npy_path"])
+    if "intrinsics" in d435_info and "depth_scale_m_per_unit" in d435_info:
+        intrinsics = d435_info["intrinsics"]
+        depth_scale = d435_info["depth_scale_m_per_unit"]
+    else:
+        meta = json.loads(Path(d435_info["meta_path"]).read_text())
+        intrinsics = meta["intrinsics"]
+        depth_scale = meta["depth_scale_m_per_unit"]
+
+    rgb_name = Path(d435_info["rgb_path"]).name
+    npy_name = Path(d435_info["npy_path"]).name
+
+    rgb_bytes = d435_info.get("rgb_bytes")
+    if rgb_bytes is None:
+        rgb_bytes = Path(d435_info["rgb_path"]).read_bytes()
+
+    npy_bytes = d435_info.get("npy_bytes")
+    if npy_bytes is None:
+        npy_bytes = Path(d435_info["npy_path"]).read_bytes()
 
     r = HTTP.post(
         f"{API_BASE}/uploadData",
         files=[
-            ("images",      (rgb_path.name, rgb_path.read_bytes(), "image/jpeg")),
-            ("depth_image", (npy_path.name, npy_path.read_bytes(), "application/octet-stream")),
+            ("images", (rgb_name, rgb_bytes, "image/jpeg")),
+            ("depth_image", (npy_name, npy_bytes, "application/octet-stream")),
         ],
         data={
-            "timestamp":           timestamp,
-            "greenhouse_row":      greenhouse_row,
+            "timestamp": timestamp,
+            "greenhouse_row": greenhouse_row,
             "distanceFromRowStart": distance,
-            "fx":          meta["intrinsics"]["fx"],
-            "fy":          meta["intrinsics"]["fy"],
-            "depth_scale": meta["depth_scale_m_per_unit"],
+            "fx": intrinsics["fx"],
+            "fy": intrinsics["fy"],
+            "depth_scale": depth_scale,
         },
         timeout=60,
     )
@@ -572,64 +620,38 @@ def capture_all():
     distance = float(body.get("distanceFromRowStart", 0.0))
 
     now = datetime.now(timezone.utc)
-    round_timestamp   = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]      # safe for dir names
-    api_ts_rgb  = _fmt_ts(now)                                      # e.g. 2026-03-19T06:14:02.973Z
-    api_ts_d435 = _fmt_ts(now + timedelta(seconds=1))               # +1 s to avoid same-key overwrite
+    round_timestamp = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    api_ts_d435 = _fmt_ts(now)
 
     round_dir = SAVE_DIR / round_timestamp
     round_dir.mkdir(parents=True, exist_ok=True)
 
-    trigger_at_ms = (time.time_ns() // 1_000_000) + 1500
-
     result = {
         "ok": True,
         "timestamp": round_timestamp,
-        "trigger_at_ms": trigger_at_ms,
         "save_dir": str(round_dir),
         "greenhouse_row": greenhouse_row,
         "distanceFromRowStart": distance,
-        "saved": {"d435": None, "pi_zeros": {}},
+        "saved": {"d435": None},
         "uploads": {},
     }
 
-    # --- Phase 1: capture all cameras in parallel ---
-    futures = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures[executor.submit(capture_d435, round_dir, trigger_at_ms)] = ("d435", "d435")
-        for cam_name, base_url in PI_ZERO_CAMS.items():
-            futures[executor.submit(capture_pi_zero, cam_name, base_url, round_dir, trigger_at_ms)] = ("pi_zero", cam_name)
-
-        for future in as_completed(futures):
-            kind, name = futures[future]
-            try:
-                saved_info = future.result()
-                if kind == "d435":
-                    result["saved"]["d435"] = saved_info
-                else:
-                    result["saved"]["pi_zeros"][name] = saved_info
-            except Exception as e:
-                result["ok"] = False
-                result[f"{name}_error"] = str(e)
-
-    # --- Phase 2: two sequential uploads with offset timestamps ---
     try:
-        result["uploads"]["rgb_pair"] = upload_rgb_pair(
-            result["saved"], greenhouse_row, distance, api_ts_rgb
-        )
+        result["saved"]["d435"] = capture_d435(round_dir)
     except Exception as e:
         result["ok"] = False
-        result["uploads"]["rgb_pair_error"] = str(e)
+        result["d435_error"] = str(e)
 
-    try:
-        result["uploads"]["d435"] = upload_d435_data(
-            result["saved"], greenhouse_row, distance, api_ts_d435
-        )
-    except Exception as e:
-        result["ok"] = False
-        result["uploads"]["d435_error"] = str(e)
+    if result["saved"]["d435"] is not None:
+        try:
+            result["uploads"]["d435"] = upload_d435_data(
+                result["saved"], greenhouse_row, distance, api_ts_d435
+            )
+        except Exception as e:
+            result["ok"] = False
+            result["uploads"]["d435_error"] = str(e)
 
     (round_dir / "capture_summary.json").write_text(json.dumps(result, indent=2))
-
     return jsonify(result)
 
 
