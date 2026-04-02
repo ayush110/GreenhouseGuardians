@@ -1,3 +1,5 @@
+from unittest import result
+
 from flask import Flask, render_template_string, jsonify, request
 import requests
 from pathlib import Path
@@ -651,9 +653,22 @@ def capture_all():
             result["ok"] = False
             result["uploads"]["d435_error"] = str(e)
 
-    (round_dir / "capture_summary.json").write_text(json.dumps(result, indent=2))
-    return jsonify(result)
+    summary_result = strip_binary_fields(result)
+    (round_dir / "capture_summary.json").write_text(json.dumps(summary_result, indent=2))
+    return jsonify(summary_result)
 
+def strip_binary_fields(obj):
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, bytes):
+                out[k] = f"<bytes:{len(v)}>"
+            else:
+                out[k] = strip_binary_fields(v)
+        return out
+    if isinstance(obj, list):
+        return [strip_binary_fields(x) for x in obj]
+    return obj
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=True, threaded=True)

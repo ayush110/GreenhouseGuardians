@@ -157,7 +157,7 @@ body {
 /* Shared styles for both MJPEG <img> and WebRTC <video> */
 .card img, .card video {
     flex: 1; width: 100%; min-height: 0;
-    object-fit: cover; display: block; background: #0d0f14;
+    object-fit: contain; display: block; background: #0d0f14;
 }
 
 /* Connecting overlay */
